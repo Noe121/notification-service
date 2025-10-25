@@ -6,10 +6,16 @@ channels, delivery tracking, and batch processing.
 """
 
 import pytest
+import sys
+import os
+from pathlib import Path
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 
-from notification_service.models import (
+# Add src directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+from models import (
     NotificationTemplate,
     UserNotificationPreference,
     Notification,
@@ -17,7 +23,7 @@ from notification_service.models import (
     DeliveryLog,
     NotificationBatch,
 )
-from notification_service.notification_service import (
+from notification_service import (
     NotificationService,
     UserPreferenceService,
     NotificationChannelService,

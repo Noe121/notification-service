@@ -15,8 +15,8 @@ from datetime import datetime
 import os
 
 # Import models and services
-from .models import Base
-from .notification_service import (
+from models import Base
+from notification_service import (
     NotificationService,
     UserPreferenceService,
     NotificationChannelService,

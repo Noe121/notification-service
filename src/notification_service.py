@@ -13,7 +13,7 @@ import logging
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, desc, func
 
-from .models import (
+from models import (
     NotificationTemplate,
     UserNotificationPreference,
     Notification,

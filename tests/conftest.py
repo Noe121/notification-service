@@ -5,10 +5,17 @@ Provides pytest fixtures for in-memory SQLite database and session management.
 """
 
 import pytest
+import sys
+import os
+from pathlib import Path
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 
-from notification_service.models import Base
+# Add src directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+from models import Base
 
 
 @pytest.fixture(scope="session")
