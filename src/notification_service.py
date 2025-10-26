@@ -13,7 +13,7 @@ import logging
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, desc, func
 
-from models import (
+from .models import (
     NotificationTemplate,
     UserNotificationPreference,
     Notification,
@@ -319,7 +319,7 @@ class UserPreferenceService:
         """Check if user allows notifications for specific channel"""
         preferences = UserPreferenceService.get_or_create_preferences(db, user_id)
 
-        if preferences.do_not_disturb_enabled:
+        if getattr(preferences, "do_not_disturb_enabled", 0) == 1:
             return False
 
         channel_enabled_map = {
@@ -406,14 +406,12 @@ class NotificationChannelService:
             .filter(NotificationChannel.id == channel_id, NotificationChannel.is_deleted == 0)
             .first()
         )
-
-        if channel and channel.verification_token == verification_token:
+        if channel is not None and getattr(channel, "verification_token", None) == verification_token:
             channel.is_verified = 1  # type: ignore[reportAttributeAccessIssue]
             channel.verified_at = datetime.utcnow()  # type: ignore[reportAttributeAccessIssue]
             db.commit()
             db.refresh(channel)
             return True
-
         return False
 
     @staticmethod
@@ -458,15 +456,14 @@ class DeliveryService:
         delivery_log_id: int,
         external_message_id: Optional[str] = None,
         response_metadata: Optional[Dict[str, Any]] = None,
-    ) -> DeliveryLog:
+    ) -> Optional[DeliveryLog]:
         """Mark delivery as successful"""
         delivery = (
             db.query(DeliveryLog)
             .filter(DeliveryLog.id == delivery_log_id, DeliveryLog.is_deleted == 0)
             .first()
         )
-
-        if delivery:
+        if delivery is not None:
             delivery.delivery_status = "delivered"  # type: ignore[reportAttributeAccessIssue]
             delivery.delivered_at = datetime.utcnow()  # type: ignore[reportAttributeAccessIssue]
             if external_message_id:
@@ -475,8 +472,8 @@ class DeliveryService:
                 delivery.response_metadata = json.dumps(response_metadata)  # type: ignore[reportAttributeAccessIssue]
             db.commit()
             db.refresh(delivery)
-
-        return delivery
+            return delivery
+        return None
 
     @staticmethod
     def mark_failed(
@@ -485,18 +482,17 @@ class DeliveryService:
         error_message: str,
         status_code: Optional[int] = None,
         should_retry: bool = True,
-    ) -> DeliveryLog:
+    ) -> Optional[DeliveryLog]:
         """Mark delivery as failed with retry logic"""
         delivery = (
             db.query(DeliveryLog)
             .filter(DeliveryLog.id == delivery_log_id, DeliveryLog.is_deleted == 0)
             .first()
         )
-
-        if delivery:
+        if delivery is not None:
             delivery.retry_count += 1  # type: ignore[reportAttributeAccessIssue]
             delivery.error_message = error_message  # type: ignore[reportAttributeAccessIssue]
-            if status_code:
+            if status_code is not None:
                 delivery.status_code = status_code  # type: ignore[reportAttributeAccessIssue]
 
             if should_retry and delivery.retry_count < delivery.max_retries:  # type: ignore[reportAttributeAccessIssue]
@@ -509,8 +505,8 @@ class DeliveryService:
 
             db.commit()
             db.refresh(delivery)
-
-        return delivery
+            return delivery
+        return None
 
     @staticmethod
     def get_delivery_statistics(db: Session, notification_id: int) -> Dict[str, Any]:
@@ -520,12 +516,10 @@ class DeliveryService:
             .filter(DeliveryLog.notification_id == notification_id, DeliveryLog.is_deleted == 0)
             .all()
         )
-
         total = len(logs)
-        delivered = len([l for l in logs if l.delivery_status == "delivered"])
-        failed = len([l for l in logs if l.delivery_status == "failed"])
-        pending = len([l for l in logs if l.delivery_status == "pending"])
-
+        delivered = len([l for l in logs if getattr(l, "delivery_status", None) == "delivered"])
+        failed = len([l for l in logs if getattr(l, "delivery_status", None) == "failed"])
+        pending = len([l for l in logs if getattr(l, "delivery_status", None) == "pending"])
         return {
             "total": total,
             "delivered": delivered,

@@ -64,8 +64,8 @@ class NotificationTemplate(Base):
             "content": self.content,
             "priority": self.priority,
             "is_active": bool(self.is_active),
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "created_at": self.created_at.isoformat() if self.created_at is not None else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at is not None else None,
         }
 
 
@@ -113,8 +113,8 @@ class UserNotificationPreference(Base):
             "push_frequency": self.push_frequency,
             "timezone": self.timezone,
             "do_not_disturb_enabled": bool(self.do_not_disturb_enabled),
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "created_at": self.created_at.isoformat() if self.created_at is not None else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at is not None else None,
         }
 
 
@@ -160,11 +160,11 @@ class Notification(Base):
             "message": self.message,
             "priority": self.priority,
             "is_read": bool(self.is_read),
-            "read_at": self.read_at.isoformat() if self.read_at else None,
-            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "read_at": self.read_at.isoformat() if self.read_at is not None else None,
+            "expires_at": self.expires_at.isoformat() if self.expires_at is not None else None,
             "source_system": self.source_system,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "created_at": self.created_at.isoformat() if self.created_at is not None else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at is not None else None,
         }
 
 
@@ -205,9 +205,9 @@ class NotificationChannel(Base):
             "is_verified": bool(self.is_verified),
             "is_primary": bool(self.is_primary),
             "is_active": bool(self.is_active),
-            "verified_at": self.verified_at.isoformat() if self.verified_at else None,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "verified_at": self.verified_at.isoformat() if self.verified_at is not None else None,
+            "created_at": self.created_at.isoformat() if self.created_at is not None else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at is not None else None,
         }
 
 
@@ -253,10 +253,10 @@ class DeliveryLog(Base):
             "status_code": self.status_code,
             "retry_count": self.retry_count,
             "max_retries": self.max_retries,
-            "delivered_at": self.delivered_at.isoformat() if self.delivered_at else None,
+            "delivered_at": self.delivered_at.isoformat() if self.delivered_at is not None else None,
             "external_message_id": self.external_message_id,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "created_at": self.created_at.isoformat() if self.created_at is not None else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at is not None else None,
         }
 
 
@@ -305,9 +305,9 @@ class NotificationBatch(Base):
             "failed_count": self.failed_count,
             "bounce_count": self.bounce_count,
             "success_rate": success_rate_value,
-            "scheduled_send_time": self.scheduled_send_time.isoformat() if self.scheduled_send_time else None,
-            "started_at": self.started_at.isoformat() if self.started_at else None,
-            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "scheduled_send_time": self.scheduled_send_time.isoformat() if self.scheduled_send_time is not None else None,
+            "started_at": self.started_at.isoformat() if self.started_at is not None else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at is not None else None,
+            "created_at": self.created_at.isoformat() if self.created_at is not None else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at is not None else None,
         }

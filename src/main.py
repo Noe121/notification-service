@@ -15,8 +15,8 @@ from datetime import datetime
 import os
 
 # Import models and services
-from models import Base
-from notification_service import (
+from .models import Base, NotificationTemplate
+from .notification_service import (
     NotificationService,
     UserPreferenceService,
     NotificationChannelService,
@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 # Database setup
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "sqlite:///./notifications.db",
+    "sqlite:////app/notifications.db",
 )
 
 engine = create_engine(
@@ -143,7 +143,7 @@ async def list_templates(
 @app.get("/templates/{template_id}", tags=["Templates"])
 async def get_template(template_id: int, db: Session = Depends(get_db)):
     """Get a specific notification template"""
-    template = db.query(db.query(NotificationService.__module__.split(".")[0]).first())
+    template = db.query(NotificationTemplate).filter(NotificationTemplate.id == template_id).first()
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
     return template.to_dict()
@@ -388,6 +388,8 @@ async def mark_delivery_success(
         delivery_log_id=delivery_log_id,
         external_message_id=external_message_id,
     )
+    if delivery is None:
+        raise HTTPException(status_code=404, detail="Delivery log not found")
     return delivery.to_dict()
 
 
@@ -400,14 +402,19 @@ async def mark_delivery_failure(
     db: Session = Depends(get_db),
 ):
     """Mark a delivery as failed"""
-    delivery = DeliveryService.mark_failed(
-        db=db,
-        delivery_log_id=delivery_log_id,
-        error_message=error_message,
-        status_code=status_code,
-        should_retry=should_retry,
-    )
-    return delivery.to_dict()
+    if hasattr(DeliveryService, "mark_failed"):
+        delivery = DeliveryService.mark_failed(
+            db=db,
+            delivery_log_id=delivery_log_id,
+            error_message=error_message,
+            status_code=status_code,
+            should_retry=should_retry,
+        )
+        if delivery is None:
+            raise HTTPException(status_code=404, detail="Delivery log not found")
+        return delivery.to_dict()
+    else:
+        raise HTTPException(status_code=500, detail="mark_failed not implemented")
 
 
 @app.get("/notifications/{notification_id}/delivery-stats", tags=["Delivery"])
@@ -416,8 +423,11 @@ async def get_delivery_statistics(
     db: Session = Depends(get_db),
 ):
     """Get delivery statistics for a notification"""
-    stats = DeliveryService.get_delivery_statistics(db=db, notification_id=notification_id)
-    return stats
+    if hasattr(DeliveryService, "get_delivery_statistics"):
+        stats = DeliveryService.get_delivery_statistics(db=db, notification_id=notification_id)
+        return stats
+    else:
+        raise HTTPException(status_code=500, detail="get_delivery_statistics not implemented")
 
 
 # ============================================================================

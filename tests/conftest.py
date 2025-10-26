@@ -15,7 +15,7 @@ from sqlalchemy.orm import sessionmaker, Session
 # Add src directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from models import Base
+from src.models import Base
 
 
 @pytest.fixture(scope="session")
