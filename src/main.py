@@ -1,7 +1,7 @@
 """
 Notification Service API Endpoints - Phase 3
 
-Comprehensive notification management including templates, preferences, 
+Comprehensive notification management including templates, preferences,
 delivery tracking, and batch processing.
 """
 
@@ -15,8 +15,8 @@ from datetime import datetime
 import os
 
 # Import models and services
-from .models import Base, NotificationTemplate
-from .notification_service import (
+from models import Base, NotificationTemplate
+from notification_service import (
     NotificationService,
     UserPreferenceService,
     NotificationChannelService,
@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 # Database setup
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "sqlite:////app/notifications.db",
+    "sqlite:///../notification_service.db/notifications.db",
 )
 
 engine = create_engine(
@@ -49,7 +49,12 @@ engine = create_engine(
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 # Create tables
-Base.metadata.create_all(bind=engine)
+try:
+    Base.metadata.create_all(bind=engine)
+    logger.info("Database tables created successfully")
+except Exception as e:
+    logger.error(f"Failed to create database tables: {e}")
+    raise
 
 
 # ============================================================================
@@ -497,4 +502,4 @@ async def http_exception_handler(request, exc):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8013)
