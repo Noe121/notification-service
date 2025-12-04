@@ -42,15 +42,15 @@ services:
       API_MODE: per-service
       SCHEMA_MODE: per-service
     ports:
-      - "8007:8007"
+      - "8013:8013"
     volumes:
       - .:/app
       - /app/__pycache__
     networks:
       - notification-network
-    command: bash -c "uvicorn main:app --host 0.0.0.0 --port 8007 --reload"
+    command: bash -c "uvicorn main:app --host 0.0.0.0 --port 8013 --reload"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8007/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8013/health"]
       interval: 30s
       timeout: 10s
       retries: 3

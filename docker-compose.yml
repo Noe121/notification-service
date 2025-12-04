@@ -7,7 +7,7 @@ services:
       dockerfile: Dockerfile
     container_name: notification-service
     ports:
-      - "8001:8001"
+      - "8013:8013"
     environment:
       - DATABASE_URL=sqlite:///./notification_service.db
       - LOG_LEVEL=INFO
@@ -15,7 +15,7 @@ services:
     volumes:
       - ./notification_service.db:/app/notification_service.db
     healthcheck:
-      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8001/health')"]
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8013/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
