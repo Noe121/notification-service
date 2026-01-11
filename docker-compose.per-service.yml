@@ -1,7 +1,7 @@
 services:
   # Notification Service Database
   notification-db:
-    image: mysql:8.0
+    image: mysql:8.4
     container_name: notification-db
     restart: unless-stopped
     environment:
