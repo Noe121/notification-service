@@ -23,6 +23,7 @@ from notification_service import (
     DeliveryService,
     NotificationBatchService,
 )
+from functools import lru_cache
 
 # ============================================================================
 # Setup
@@ -36,11 +37,21 @@ app = FastAPI(
 
 logger = logging.getLogger(__name__)
 
-# Database setup
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "sqlite:///../notification_service.db/notifications.db",
-)
+# Database setup - Load from Secrets Manager
+SECRET_NAME = os.getenv("DB_SECRET_NAME", "dev-notification-db-credentials")
+
+@lru_cache(maxsize=1)
+def _get_db_url() -> str:
+    """Fetch DB credentials from Secrets Manager and build SQLAlchemy URL."""
+    try:
+        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+        from shared.secrets_manager import get_db_connection_string
+        return get_db_connection_string(SECRET_NAME)
+    except Exception as e:
+        logger.warning(f"Could not load from Secrets Manager: {e}. Using fallback.")
+        return "sqlite:///../notification_service.db/notifications.db"
+
+DATABASE_URL = os.getenv("DATABASE_URL", None) or _get_db_url()
 
 engine = create_engine(
     DATABASE_URL,
