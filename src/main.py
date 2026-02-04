@@ -13,6 +13,7 @@ import logging
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 import os
+import sys
 
 # Import models and services
 from models import Base, NotificationTemplate
