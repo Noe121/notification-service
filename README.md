@@ -187,6 +187,29 @@ aws ecs update-service \
   --region us-east-1
 ```
 
+## Delivery Worker
+
+Deploy the built-in delivery worker to fulfill pending logs that sit in `delivery_logs.delivery_status = "pending"`.
+
+### Run
+
+```bash
+# activate the virtualenv
+source venv/bin/activate
+python -m src.workers.delivery_worker
+```
+
+### Environment
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `NOTIFICATION_SERVICE_URL` | Base URL the worker calls for delivery/control APIs | `http://localhost:8013` |
+| `DELIVERY_WORKER_POLL_SECONDS` | Seconds between polls | `15` |
+| `DELIVERY_WORKER_BATCH_SIZE` | How many logs to fetch per poll | `50` |
+| `DELIVERY_WORKER_LOG_LEVEL` | Python logging level | `INFO` |
+
+The worker currently ships with placeholder handlers for `email`, `sms`, `push`, and `webhook` that only log and back off briefly. Replace those with your SMTP/Twilio/push gateway integrations and make sure each handler returns `external_message_id`/`response_metadata` metadata so the worker can report success via `POST /delivery/{delivery_log_id}/success`.
+
 ## Architecture Notes
 
 ### Migration from Per-Service to Consolidated Database

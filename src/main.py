@@ -237,6 +237,21 @@ async def get_user_notifications(
     }
 
 
+@app.get("/notifications/{notification_id}", tags=["Notifications"])
+async def get_notification(
+    notification_id: int,
+    db: Session = Depends(get_db),
+):
+    """Get a single notification record"""
+    notification = NotificationService.get_notification_by_id(
+        db=db,
+        notification_id=notification_id,
+    )
+    if not notification:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    return notification.to_dict()
+
+
 @app.put("/notifications/{notification_id}/read", tags=["Notifications"])
 async def mark_notification_read(
     notification_id: int,
@@ -364,6 +379,18 @@ async def verify_channel(
     if not success:
         raise HTTPException(status_code=400, detail="Verification failed")
     return {"message": "Channel verified"}
+
+
+@app.get("/channels/{channel_id}", tags=["Channels"])
+async def get_channel(
+    channel_id: int,
+    db: Session = Depends(get_db),
+):
+    """Retrieve a specific notification channel"""
+    channel = NotificationChannelService.get_channel_by_id(db=db, channel_id=channel_id)
+    if not channel:
+        raise HTTPException(status_code=404, detail="Channel not found")
+    return channel.to_dict()
 
 
 @app.delete("/channels/{channel_id}", tags=["Channels"])

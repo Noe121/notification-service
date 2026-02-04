@@ -230,6 +230,15 @@ class NotificationService:
         return notifications, total
 
     @staticmethod
+    def get_notification_by_id(db: Session, notification_id: int) -> Optional[Notification]:
+        """Retrieve a single notification by ID (ignoring soft deletes)"""
+        return (
+            db.query(Notification)
+            .filter(Notification.id == notification_id, Notification.is_deleted == 0)
+            .first()
+        )
+
+    @staticmethod
     def delete_notification(db: Session, notification_id: int, user_id: int) -> bool:
         """Soft delete a notification"""
         notification = (
@@ -429,6 +438,15 @@ class NotificationChannelService:
             return True
 
         return False
+
+    @staticmethod
+    def get_channel_by_id(db: Session, channel_id: int) -> Optional[NotificationChannel]:
+        """Retrieve a notification channel by ID"""
+        return (
+            db.query(NotificationChannel)
+            .filter(NotificationChannel.id == channel_id, NotificationChannel.is_deleted == 0)
+            .first()
+        )
 
 
 class DeliveryService:
