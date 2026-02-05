@@ -16,8 +16,8 @@ import os
 import sys
 
 # Import models and services
-from models import Base, NotificationTemplate
-from notification_service import (
+from .models import Base, NotificationTemplate
+from .notification_service import (
     NotificationService,
     UserPreferenceService,
     NotificationChannelService,
@@ -60,13 +60,22 @@ engine = create_engine(
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-# Create tables
-try:
-    Base.metadata.create_all(bind=engine)
-    logger.info("Database tables created successfully")
-except Exception as e:
-    logger.error(f"Failed to create database tables: {e}")
-    raise
+# Note: Tables are created via migrations (V001__initial_schema.sql)
+# We only create tables on non-production environments for local testing
+if os.getenv("ENVIRONMENT", "local") == "local" and "sqlite" in DATABASE_URL:
+    try:
+        Base.metadata.create_all(bind=engine)
+        logger.info("Database tables created successfully (local mode)")
+    except Exception as e:
+        logger.warning(f"Could not create database tables: {e}")
+# NOTE: Tables are managed by Flyway migrations, NOT created here
+# Attempting to create tables from models will fail due to schema mismatch
+# if os.getenv("ENVIRONMENT", "local") == "local" and "sqlite" in DATABASE_URL:
+#     try:
+#         Base.metadata.create_all(bind=engine)
+#         logger.info("Database tables created successfully (local mode)")
+#     except Exception as e:
+#         logger.warning(f"Could not create database tables: {e}")
 
 
 # ============================================================================
