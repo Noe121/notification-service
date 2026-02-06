@@ -30,12 +30,6 @@ from functools import lru_cache
 # Setup
 # ============================================================================
 
-app = FastAPI(
-    title="Notification Service API",
-    description="Comprehensive notification management service with multi-channel delivery",
-    version="3.0.0",
-)
-
 logger = logging.getLogger(__name__)
 
 # Database setup - Load from Secrets Manager
@@ -93,8 +87,53 @@ def get_db():
 
 
 # ============================================================================
-# Health Check
+# Background Tasks (Data Sync Consumer)
 # ============================================================================
+
+import asyncio
+from contextlib import asynccontextmanager
+
+# Store background tasks
+background_tasks: Dict[str, asyncio.Task] = {}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown events"""
+    # Startup
+    logger.info("Starting notification service background tasks...")
+
+    # Start data sync consumer if queue URL is configured
+    sync_queue_url = os.getenv("DATA_SYNC_EVENTS_QUEUE_URL")
+    if sync_queue_url:
+        try:
+            from src.workers.data_sync_consumer import start_consumer
+            task = asyncio.create_task(start_consumer())
+            background_tasks["data_sync_consumer"] = task
+            logger.info("Data sync consumer started")
+        except Exception as e:
+            logger.warning(f"Could not start data sync consumer: {e}")
+
+    yield
+
+    # Shutdown
+    logger.info("Shutting down notification service...")
+    for name, task in background_tasks.items():
+        if task and not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                logger.warning(f"Background task {name} shutdown timeout")
+
+
+# Update app with lifespan
+app = FastAPI(
+    title="Notification Service API",
+    description="Comprehensive notification management service with multi-channel delivery",
+    version="3.0.0",
+    lifespan=lifespan,
+)
 
 
 @app.get("/health", tags=["Health"])
