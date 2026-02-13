@@ -11,13 +11,17 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements
-COPY requirements.txt .
+COPY notification-service/requirements.txt .
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python dependencies and fail fast if critical runtime deps are missing
+RUN pip install --no-cache-dir -r requirements.txt && \
+    python -c "import requests, httpx; print('deps-ok')"
+
+# Copy shared module (required for middleware imports)
+COPY shared/ shared/
 
 # Copy application
-COPY src/ src/
+COPY notification-service/src/ src/
 
 # Create non-root user with proper directory permissions
 RUN useradd -m -u 1000 appuser && \

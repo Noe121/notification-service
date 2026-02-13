@@ -11,6 +11,7 @@ The Notification Service provides comprehensive notification management includin
 - **Delivery Tracking**: Real-time status monitoring and delivery confirmation
 - **Batch Processing**: Efficient bulk notification dispatch
 - **Quiet Hours**: Respect user do-not-disturb preferences
+- **Novu In-App Inbox**: Workflow-driven notifications via Novu Cloud with React `<Inbox />` component
 
 ## Database
 
@@ -27,6 +28,7 @@ Active migrations: `NILbx-env/modules/db/mysql/migrations/notifications_db/`
 - **Python**: 3.11
 - **Deployment**: AWS ECS Fargate (Docker)
 - **Database Driver**: PyMySQL 1.1.0
+- **In-App Inbox**: Novu Cloud (`@novu/react` on frontend, Novu API on backend)
 
 ## Local Development
 
@@ -220,11 +222,47 @@ This service was migrated from individual `notification_service_db` to the conso
 - **Benefits**: Reduced cost, simplified management, improved query performance
 - **Migration**: Legacy migrations archived in `migrations/archive/`
 
+### Novu In-App Inbox (Frontend)
+
+The React frontend uses [Novu](https://novu.co) Cloud for the in-app notification inbox, integrated alongside this service's existing notification panel.
+
+**How it works:**
+1. An app event occurs (deal created, payment received, etc.)
+2. Celery task in `company-api` triggers a Novu workflow via the Novu API/SDK
+3. Novu delivers the notification to the user's in-app inbox (and optionally email/SMS/push)
+4. The `<Inbox />` component in the frontend renders the notification bell and popover
+
+**Frontend component:** `frontend/src/components/NotificationInbox.jsx`
+
+**Frontend environment variable:**
+```
+VITE_NOVU_APPLICATION_IDENTIFIER=<your-novu-app-id>
+```
+
+**Subscriber ID:** Maps to `user.id` from the auth system (JWT payload). Each authenticated user is a Novu subscriber.
+
+**Backend trigger example (Celery task):**
+```python
+from novu.api import EventApi
+
+event_api = EventApi("https://api.novu.co", "<NOVU_API_KEY>")
+event_api.trigger(
+    name="invoice-paid",
+    recipients="<user_id>",
+    payload={"amount": amount, "invoiceId": invoice_id},
+)
+```
+
+**Novu dashboard:** Manage workflows, templates, and delivery channels at [app.novu.co](https://app.novu.co)
+
+**Coexistence:** The Novu Inbox coexists with the existing `NotificationsPanel.jsx` (MUI-based drawer) and `notificationService.js` polling. Both systems are active; Novu handles workflow-driven notifications while the legacy panel serves direct API-driven notifications.
+
 ### Integration Points
 - **Auth Service**: User authentication via bearer tokens
 - **Payment Service**: Notification of payment status
 - **Contract Service**: Deal status updates
 - **Compliance Service**: Compliance alert notifications
+- **Novu Cloud**: In-app inbox, workflow orchestration, multi-channel delivery
 
 ## Troubleshooting
 
