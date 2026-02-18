@@ -13,34 +13,50 @@ import logging
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 import os
+import sys
 
 # Import models and services
-from models import Base, NotificationTemplate
-from notification_service import (
+from .models import Base, NotificationTemplate
+from .notification_service import (
     NotificationService,
     UserPreferenceService,
     NotificationChannelService,
     DeliveryService,
     NotificationBatchService,
 )
+from functools import lru_cache
+
+# NIL Platform Middleware
+try:
+    from shared.middleware import CorrelationMiddleware, IdempotencyMiddleware, InMemoryIdempotencyBackend
+except ImportError:
+    from pathlib import Path
+    _repo_root = str(Path(__file__).resolve().parents[2])
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
+    from shared.middleware import CorrelationMiddleware, IdempotencyMiddleware, InMemoryIdempotencyBackend
 
 # ============================================================================
 # Setup
 # ============================================================================
 
-app = FastAPI(
-    title="Notification Service API",
-    description="Comprehensive notification management service with multi-channel delivery",
-    version="3.0.0",
-)
-
 logger = logging.getLogger(__name__)
 
-# Database setup
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "sqlite:///../notification_service.db/notifications.db",
-)
+# Database setup - Load from Secrets Manager
+SECRET_NAME = os.getenv("DB_SECRET_NAME", "dev-notification-db-credentials")
+
+@lru_cache(maxsize=1)
+def _get_db_url() -> str:
+    """Fetch DB credentials from Secrets Manager and build SQLAlchemy URL."""
+    try:
+        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+        from shared.secrets_manager import get_db_connection_string
+        return get_db_connection_string(SECRET_NAME)
+    except Exception as e:
+        logger.warning(f"Could not load from Secrets Manager: {e}. Using fallback.")
+        return "sqlite:///../notification_service.db/notifications.db"
+
+DATABASE_URL = os.getenv("DATABASE_URL", None) or _get_db_url()
 
 engine = create_engine(
     DATABASE_URL,
@@ -48,13 +64,22 @@ engine = create_engine(
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-# Create tables
-try:
-    Base.metadata.create_all(bind=engine)
-    logger.info("Database tables created successfully")
-except Exception as e:
-    logger.error(f"Failed to create database tables: {e}")
-    raise
+# Note: Tables are created via migrations (V001__initial_schema.sql)
+# We only create tables on non-production environments for local testing
+if os.getenv("ENVIRONMENT", "local") == "local" and "sqlite" in DATABASE_URL:
+    try:
+        Base.metadata.create_all(bind=engine)
+        logger.info("Database tables created successfully (local mode)")
+    except Exception as e:
+        logger.warning(f"Could not create database tables: {e}")
+# NOTE: Tables are managed by Flyway migrations, NOT created here
+# Attempting to create tables from models will fail due to schema mismatch
+# if os.getenv("ENVIRONMENT", "local") == "local" and "sqlite" in DATABASE_URL:
+#     try:
+#         Base.metadata.create_all(bind=engine)
+#         logger.info("Database tables created successfully (local mode)")
+#     except Exception as e:
+#         logger.warning(f"Could not create database tables: {e}")
 
 
 # ============================================================================
@@ -72,8 +97,58 @@ def get_db():
 
 
 # ============================================================================
-# Health Check
+# Background Tasks (Data Sync Consumer)
 # ============================================================================
+
+import asyncio
+from contextlib import asynccontextmanager
+
+# Store background tasks
+background_tasks: Dict[str, asyncio.Task] = {}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown events"""
+    # Startup
+    logger.info("Starting notification service background tasks...")
+
+    # Start data sync consumer if queue URL is configured
+    sync_queue_url = os.getenv("DATA_SYNC_EVENTS_QUEUE_URL")
+    if sync_queue_url:
+        try:
+            from src.workers.data_sync_consumer import start_consumer
+            task = asyncio.create_task(start_consumer())
+            background_tasks["data_sync_consumer"] = task
+            logger.info("Data sync consumer started")
+        except Exception as e:
+            logger.warning(f"Could not start data sync consumer: {e}")
+
+    yield
+
+    # Shutdown
+    logger.info("Shutting down notification service...")
+    for name, task in background_tasks.items():
+        if task and not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                logger.warning(f"Background task {name} shutdown timeout")
+
+
+# Update app with lifespan
+app = FastAPI(
+    title="Notification Service API",
+    description="Comprehensive notification management service with multi-channel delivery",
+    version="3.0.0",
+    lifespan=lifespan,
+)
+
+# NIL Platform Middleware
+app.add_middleware(CorrelationMiddleware)
+if os.getenv("IDEMPOTENCY_MIDDLEWARE_ENABLED", "false").lower() == "true":
+    app.add_middleware(IdempotencyMiddleware, backend=InMemoryIdempotencyBackend())
 
 
 @app.get("/health", tags=["Health"])
@@ -225,6 +300,21 @@ async def get_user_notifications(
     }
 
 
+@app.get("/notifications/{notification_id}", tags=["Notifications"])
+async def get_notification(
+    notification_id: int,
+    db: Session = Depends(get_db),
+):
+    """Get a single notification record"""
+    notification = NotificationService.get_notification_by_id(
+        db=db,
+        notification_id=notification_id,
+    )
+    if not notification:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    return notification.to_dict()
+
+
 @app.put("/notifications/{notification_id}/read", tags=["Notifications"])
 async def mark_notification_read(
     notification_id: int,
@@ -352,6 +442,18 @@ async def verify_channel(
     if not success:
         raise HTTPException(status_code=400, detail="Verification failed")
     return {"message": "Channel verified"}
+
+
+@app.get("/channels/{channel_id}", tags=["Channels"])
+async def get_channel(
+    channel_id: int,
+    db: Session = Depends(get_db),
+):
+    """Retrieve a specific notification channel"""
+    channel = NotificationChannelService.get_channel_by_id(db=db, channel_id=channel_id)
+    if not channel:
+        raise HTTPException(status_code=404, detail="Channel not found")
+    return channel.to_dict()
 
 
 @app.delete("/channels/{channel_id}", tags=["Channels"])
