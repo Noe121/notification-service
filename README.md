@@ -258,6 +258,49 @@ event_api.trigger(
 **Coexistence:** The Novu Inbox coexists with the existing `NotificationsPanel.jsx` (MUI-based drawer) and `notificationService.js` polling. Both systems are active; Novu handles workflow-driven notifications while the legacy panel serves direct API-driven notifications.
 
 ### Integration Points
+
+## Novu Email Verification (SES-backed)
+
+This service supports a dedicated Novu workflow for account verification email using your existing Novu + SES setup (`no-reply@notify.nilbx.com`, config set `nilbx-notify`).
+
+### Backend Trigger Helper
+
+Use `notification-service/src/novu_client.py`:
+
+```python
+from src.novu_client import trigger_email_verification
+
+await trigger_email_verification(
+    user_id=user.id,
+    email=user.email,
+    first_name=user.first_name or "",
+    verification_method="otp",  # "otp" | "magic_link" | "both"
+    verification_code="123456",  # required for otp/both
+    magic_link="https://nilbx.com/verify?token=...",  # required for magic_link/both
+    expires_minutes=10,
+)
+```
+
+### Required Novu Workflow
+
+- Workflow identifier: `email-verification` (or override via `NOVU_EMAIL_VERIFICATION_WORKFLOW_ID`)
+- Expected payload variables:
+  - `verificationMethod`
+  - `verificationCode`
+  - `magicLink`
+  - `expiresMinutes`
+  - `appUrl`
+  - `supportEmail`
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `NOVU_SECRET_KEY` | Novu API key | - |
+| `NOVU_API_URL` | Novu API base URL | `https://api.novu.co/v1` |
+| `NOVU_EMAIL_VERIFICATION_WORKFLOW_ID` | Verification workflow identifier | `email-verification` |
+| `NOVU_APP_URL` | Application URL used in payloads | `https://nilbx.com` |
+| `NOVU_SUPPORT_EMAIL` | Support contact in templates | `support@nilbx.com` |
 - **Auth Service**: User authentication via bearer tokens
 - **Payment Service**: Notification of payment status
 - **Contract Service**: Deal status updates
