@@ -124,6 +124,23 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Could not start data sync consumer: {e}")
 
+    # Start live-stream notification consumer if queue URL is configured
+    live_stream_queue_url = os.getenv("LIVE_STREAM_NOTIFICATIONS_QUEUE_URL")
+    if live_stream_queue_url:
+        try:
+            from src.workers.live_stream_consumer import LiveStreamNotificationConsumer
+
+            def _db_factory():
+                return SessionLocal()
+
+            consumer = LiveStreamNotificationConsumer.from_env(db_session_factory=_db_factory)
+            if consumer:
+                task = asyncio.create_task(asyncio.to_thread(consumer.run_forever))
+                background_tasks["live_stream_consumer"] = task
+                logger.info("Live-stream notification consumer started")
+        except Exception as e:
+            logger.warning(f"Could not start live-stream notification consumer: {e}")
+
     yield
 
     # Shutdown
