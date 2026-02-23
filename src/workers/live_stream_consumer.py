@@ -112,13 +112,14 @@ class LiveStreamNotificationConsumer:
                     notification_type,
                 )
                 return
+            template_id = int(getattr(template, "id"))
 
             NotificationService.send_notification(
                 db=db,
                 user_id=int(owner_user_id),
-                template_id=template.id,
+                template_id=template_id,
                 notification_type=notification_type,
-                content={
+                data_payload={
                     "stream_id": stream_id,
                     "event_type": event_type,
                     "occurred_at": event.get("occurred_at"),
