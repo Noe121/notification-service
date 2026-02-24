@@ -27,6 +27,7 @@ _NOTIFICATION_TYPE_MAP: Dict[str, str] = {
     "live_stream.started": "live_stream_started",
     "live_stream.ended": "live_stream_ended",
     "live_stream.recording.ready": "live_stream_recording_ready",
+    "live_stream.live_now": "live_stream_live_now",
 }
 
 
@@ -87,11 +88,52 @@ class LiveStreamNotificationConsumer:
     def _dispatch(self, event_type: str, notification_type: str, event: Dict[str, Any]) -> None:
         """
         Find the active template for notification_type and enqueue a delivery.
-        Fails gracefully if no template exists for this notification type.
+        For live_stream.live_now, fans are listed in rsvp_user_ids[] in the payload
+        rather than derived from the actor. Fails gracefully if no template exists.
         """
         db = self.db_session_factory()
         try:
             stream_id = event.get("stream_id", "")
+            payload_data = event.get("payload") or event  # SNS wraps payload in "payload" field
+
+            # live_stream.live_now: notify each RSVP'd fan individually
+            if event_type == "live_stream.live_now":
+                rsvp_user_ids = payload_data.get("rsvp_user_ids") or event.get("rsvp_user_ids") or []
+                if not rsvp_user_ids:
+                    logger.debug("live_stream.live_now with empty rsvp_user_ids for stream %s", stream_id)
+                    return
+                templates, _ = NotificationService.get_active_templates(db=db, template_type="in_app")
+                template = next(
+                    (t for t in templates if notification_type in (t.template_name or "")), None
+                )
+                if not template:
+                    logger.info("No template for %s – skipping", notification_type)
+                    return
+                template_id = int(getattr(template, "id"))
+                fan_payload = {
+                    "stream_id": stream_id,
+                    "stream_title": payload_data.get("stream_title") or event.get("stream_title", ""),
+                    "hls_url": payload_data.get("hls_url") or event.get("hls_url", ""),
+                    "influencer_name": payload_data.get("influencer_name") or event.get("influencer_name", ""),
+                    "event_type": event_type,
+                }
+                dispatched = 0
+                for fan_id in rsvp_user_ids:
+                    try:
+                        NotificationService.send_notification(
+                            db=db,
+                            user_id=int(fan_id),
+                            template_id=template_id,
+                            notification_type=notification_type,
+                            data_payload=fan_payload,
+                        )
+                        dispatched += 1
+                    except Exception as fan_exc:
+                        logger.warning("Failed to notify fan %s for stream %s: %s", fan_id, stream_id, fan_exc)
+                logger.info("live_stream.live_now: notified %d/%d fans for stream %s", dispatched, len(rsvp_user_ids), stream_id)
+                return
+
+            # Default path: single notification to stream owner
             actor = event.get("actor") or {}
             owner_user_id = actor.get("user_id")
             if not owner_user_id:
