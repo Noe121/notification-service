@@ -155,6 +155,38 @@ async def lifespan(app: FastAPI):
 
 
 # Update app with lifespan
+# ---------------------------------------------------------------------------
+# CSRF protection for cookie-authenticated mutating requests
+# ---------------------------------------------------------------------------
+import hmac as _hmac
+import os as _csrf_os
+from starlette.middleware.base import BaseHTTPMiddleware as _BaseHTTPMiddleware
+from fastapi.responses import JSONResponse as _JSONResponse
+
+_SESSION_COOKIE_NAME = _csrf_os.getenv("SESSION_COOKIE_NAME", "nilbx_session")
+_CSRF_COOKIE_NAME = _csrf_os.getenv("CSRF_COOKIE_NAME", "nilbx_csrf")
+_COOKIE_AUTH_ENABLED = _csrf_os.getenv("COOKIE_AUTH_ENABLED", "true").lower() == "true"
+_CSRF_PROTECTION_ENABLED = _csrf_os.getenv("CSRF_PROTECTION_ENABLED", "true").lower() == "true"
+_CSRF_EXEMPT_PATHS = {"/health", "/docs", "/openapi.json", "/redoc"}
+
+
+class CSRFMiddleware(_BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        if not (_CSRF_PROTECTION_ENABLED and _COOKIE_AUTH_ENABLED):
+            return await call_next(request)
+        if request.method.upper() in {"GET", "HEAD", "OPTIONS"}:
+            return await call_next(request)
+        if request.url.path in _CSRF_EXEMPT_PATHS:
+            return await call_next(request)
+        if not request.cookies.get(_SESSION_COOKIE_NAME):
+            return await call_next(request)
+        csrf_cookie = request.cookies.get(_CSRF_COOKIE_NAME)
+        csrf_header = request.headers.get("X-CSRF-Token")
+        if not csrf_cookie or not csrf_header or not _hmac.compare_digest(csrf_cookie, csrf_header):
+            return _JSONResponse(status_code=403, content={"detail": "CSRF validation failed"})
+        return await call_next(request)
+
+
 app = FastAPI(
     title="Notification Service API",
     description="Comprehensive notification management service with multi-channel delivery",
@@ -164,6 +196,7 @@ app = FastAPI(
 
 # NIL Platform Middleware
 app.add_middleware(CorrelationMiddleware)
+app.add_middleware(CSRFMiddleware)  # CSRF: cookie-authenticated mutating requests
 if os.getenv("IDEMPOTENCY_MIDDLEWARE_ENABLED", "false").lower() == "true":
     app.add_middleware(IdempotencyMiddleware, backend=InMemoryIdempotencyBackend())
 
