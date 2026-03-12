@@ -42,21 +42,19 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Database setup - Load from Secrets Manager
-SECRET_NAME = os.getenv("DB_SECRET_NAME", "dev-notification-db-credentials")
-
-@lru_cache(maxsize=1)
-def _get_db_url() -> str:
-    """Fetch DB credentials from Secrets Manager and build SQLAlchemy URL."""
-    try:
-        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-        from shared.secrets_manager import get_db_connection_string
-        return get_db_connection_string(SECRET_NAME)
-    except Exception as e:
-        logger.warning(f"Could not load from Secrets Manager: {e}. Using fallback.")
+# Database setup — credentials injected by ECS secrets block
+def _build_db_url() -> str:
+    """Build MySQL URL from env vars (DB_HOST, DB_USERNAME, DB_PASSWORD, DB_NAME)."""
+    host = os.getenv("DB_HOST", "localhost")
+    port = os.getenv("DB_PORT", "3306")
+    user = os.getenv("DB_USERNAME", "notifuser")
+    password = os.getenv("DB_PASSWORD", "")
+    dbname = os.getenv("DB_NAME", "notifications_db")
+    if not password:
         return "sqlite:///../notification_service.db/notifications.db"
+    return f"mysql+pymysql://{user}:{password}@{host}:{port}/{dbname}"
 
-DATABASE_URL = os.getenv("DATABASE_URL", None) or _get_db_url()
+DATABASE_URL = os.getenv("DATABASE_URL", None) or _build_db_url()
 
 engine = create_engine(
     DATABASE_URL,
