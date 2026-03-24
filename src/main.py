@@ -51,7 +51,13 @@ def _build_db_url() -> str:
     password = os.getenv("DB_PASSWORD", "")
     dbname = os.getenv("DB_NAME", "notifications_db")
     if not password:
-        return "sqlite:///../notification_service.db/notifications.db"
+        import warnings
+        warnings.warn(
+            "DB_PASSWORD not set — falling back to SQLite. "
+            "This MUST NOT happen in production (set DB_PASSWORD or DATABASE_URL).",
+            stacklevel=2,
+        )
+        return "sqlite:///notifications.db"
     return f"mysql+pymysql://{user}:{password}@{host}:{port}/{dbname}"
 
 DATABASE_URL = os.getenv("DATABASE_URL", None) or _build_db_url()
@@ -150,6 +156,13 @@ async def lifespan(app: FastAPI):
                 await asyncio.wait_for(task, timeout=5.0)
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 logger.warning(f"Background task {name} shutdown timeout")
+
+    # Dispose DB connection pool
+    try:
+        engine.dispose()
+        logger.info("DB connection pool disposed")
+    except Exception:
+        pass
 
 
 # Update app with lifespan

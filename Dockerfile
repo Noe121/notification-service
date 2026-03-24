@@ -1,41 +1,39 @@
 # Notification Service - Production Dockerfile
+# ---------- builder stage ----------
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY notification-service/requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+# ---------- runtime stage ----------
 FROM python:3.11-slim
 
-# Set working directory
-WORKDIR /app
-
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    gcc \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements
-COPY notification-service/requirements.txt .
+COPY --from=builder /install /usr/local
 
-# Install Python dependencies and fail fast if critical runtime deps are missing
-RUN pip install --no-cache-dir -r requirements.txt && \
-    python -c "import requests, httpx; print('deps-ok')"
+# Verify critical deps
+RUN python -c "import requests, httpx; print('deps-ok')"
 
-# Copy shared module (required for middleware imports)
-COPY shared/ shared/
+RUN useradd -m -u 1000 appuser
+WORKDIR /app
 
-# Copy application
-COPY notification-service/src/ src/
-
-# Create non-root user with proper directory permissions
-RUN useradd -m -u 1000 appuser && \
-    chown -R appuser:appuser /app && \
-    chmod 775 /app
+COPY --chown=appuser:appuser shared/ shared/
+COPY --chown=appuser:appuser notification-service/src/ src/
 
 USER appuser
 
-# Expose port
 EXPOSE 8012
 
-# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import httpx; httpx.get('http://localhost:8012/health', timeout=2.0)" || exit 1
+    CMD curl -sf http://localhost:8012/health || exit 1
 
-# Run application
 CMD ["python", "-m", "uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8012"]
