@@ -62,9 +62,36 @@ def _build_db_url() -> str:
 
 DATABASE_URL = os.getenv("DATABASE_URL", None) or _build_db_url()
 
+
+def _db_connect_args() -> dict:
+    if "sqlite" in DATABASE_URL:
+        return {"check_same_thread": False}
+    import ssl as _ssl
+    host = os.getenv("DB_HOST", "localhost").strip().lower()
+    env = os.getenv("ENVIRONMENT", "development").strip().lower()
+    ssl_override = os.getenv("DB_SSL_ENABLED")
+    is_local = host in {"localhost", "127.0.0.1", "mysql", "notif-mysql"}
+    if ssl_override is not None:
+        enabled = ssl_override.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        enabled = not (is_local and env in {"development", "local", "test"})
+    if not enabled:
+        return {}
+    ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+    ca = os.getenv("DB_SSL_CA_PATH", "/etc/ssl/certs/global-bundle.pem").strip()
+    if ca and os.path.isfile(ca):
+        ctx.load_verify_locations(ca)
+        ctx.check_hostname = True
+        ctx.verify_mode = _ssl.CERT_REQUIRED
+    else:
+        ctx.check_hostname = False
+        ctx.verify_mode = _ssl.CERT_NONE
+    return {"ssl": ctx}
+
+
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {},
+    connect_args=_db_connect_args(),
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
