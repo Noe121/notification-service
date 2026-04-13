@@ -242,6 +242,13 @@ class Notification(Base):
 
     # Relationships
     deliveries = relationship("NotificationDelivery", back_populates="notification", cascade="all, delete-orphan")
+    # New 2026-04-11: expose the parent NotificationType so to_dict() can emit
+    # the human-readable `type_code` string ("deal_created", "payment_received",
+    # ...) alongside the FK int. Both web (NotificationsPanel.jsx) and iOS
+    # (NotificationsView.swift) switch on the string code for icon/color
+    # mapping; without this enrichment they fell through to the default bell
+    # for every server-backed row. Bug #20 in e2e_coverage_state.md.
+    notification_type = relationship("NotificationType", lazy="joined")
 
     __table_args__ = (
         Index("idx_notif_user_id", "user_id"),
@@ -257,10 +264,19 @@ class Notification(Base):
             "id": self.id,
             "user_id": self.user_id,
             "notification_type_id": self.notification_type_id,
+            # `notification_type` is the string code resolved via the
+            # joined NotificationType relationship. Web + iOS clients use
+            # this for icon/color mapping. Falls back to None when the
+            # related row is missing (shouldn't happen — FK is NOT NULL).
+            "notification_type": self.notification_type.type_code if self.notification_type else None,
             "template_id": self.template_id,
             "priority": self.priority,
             "title": self.title,
             "body": self.body,
+            # Backward-compat alias so legacy clients reading `message`
+            # still see the body text. New clients should read `body`
+            # directly.
+            "message": self.body,
             "data_payload": self.data_payload,
             "source_system": self.source_system,
             "source_reference_id": self.source_reference_id,

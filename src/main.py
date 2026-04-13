@@ -5,7 +5,7 @@ Comprehensive notification management including templates, preferences,
 delivery tracking, and batch processing.
 """
 
-from fastapi import FastAPI, HTTPException, Depends, status, Query
+from fastapi import APIRouter, FastAPI, HTTPException, Depends, status, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy import create_engine
@@ -23,6 +23,15 @@ from .notification_service import (
     NotificationChannelService,
     DeliveryService,
     NotificationBatchService,
+)
+# Auth gate (added 2026-04-11). Before this module landed every route on
+# notification-service was open to anyone with network reach. See
+# notification-service/src/auth.py for the rationale.
+from .auth import (
+    require_bearer_actor,
+    require_admin,
+    assert_self_or_admin,
+    ADMIN_BYPASS_ROLES as ADMIN_BYPASS_ROLES_LOCAL,
 )
 from functools import lru_cache
 
@@ -239,9 +248,36 @@ if os.getenv("IDEMPOTENCY_MIDDLEWARE_ENABLED", "false").lower() == "true":
     app.add_middleware(IdempotencyMiddleware, backend=InMemoryIdempotencyBackend())
 
 
+# ---------------------------------------------------------------------------
+# Routing strategy
+# ---------------------------------------------------------------------------
+# Public surface is mounted under /api/notifications/* via `api_router` so it
+# matches the dev/staging/prod ALB rule (`/api/notifications*` → notification
+# service target group). Without this prefix the FastAPI handlers were flat
+# (`/templates`, `/notifications`, `/users/{id}/preferences`, etc.) and
+# nothing routed to them publicly.
+#
+# /health stays at the root path because the ALB target-group health check
+# (and AWS-provided container health monitors) hit `/health` directly on the
+# container's port 8012, not via the path-based listener rule. Mirroring the
+# health check at /api/notifications/health is also useful for callers that
+# only know the public prefix.
+api_router = APIRouter(prefix="/api/notifications")
+
+
 @app.get("/health", tags=["Health"])
-async def health_check():
-    """Health check endpoint"""
+async def health_check_root():
+    """Container/ALB health probe — kept at root for the target group health
+    check, which only knows about port 8012 + /health (no path rewriting).
+    Mirrored at /api/notifications/health below for clients that talk to the
+    public prefix."""
+    return {"status": "healthy", "service": "notification-service"}
+
+
+@api_router.get("/health", tags=["Health"])
+async def health_check_public():
+    """Public health probe — same payload as /health, served under the
+    /api/notifications prefix so dev clients can hit it through the ALB."""
     return {"status": "healthy", "service": "notification-service"}
 
 
@@ -250,7 +286,7 @@ async def health_check():
 # ============================================================================
 
 
-@app.post("/templates", tags=["Templates"], status_code=201)
+@api_router.post("/templates", tags=["Templates"], status_code=201)
 async def create_template(
     template_name: str,
     template_type: str,
@@ -259,6 +295,7 @@ async def create_template(
     variables: Optional[List[str]] = None,
     priority: str = "normal",
     db: Session = Depends(get_db),
+    actor: Dict[str, Any] = Depends(require_admin),
 ):
     """
     Create a new notification template
@@ -286,12 +323,13 @@ async def create_template(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.get("/templates", tags=["Templates"])
+@api_router.get("/templates", tags=["Templates"])
 async def list_templates(
     template_type: Optional[str] = None,
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
+    actor: Dict[str, Any] = Depends(require_admin),
 ):
     """Get active notification templates"""
     templates, total = NotificationService.get_active_templates(
@@ -308,8 +346,12 @@ async def list_templates(
     }
 
 
-@app.get("/templates/{template_id}", tags=["Templates"])
-async def get_template(template_id: int, db: Session = Depends(get_db)):
+@api_router.get("/templates/{template_id}", tags=["Templates"])
+async def get_template(
+    template_id: int,
+    db: Session = Depends(get_db),
+    actor: Dict[str, Any] = Depends(require_admin),
+):
     """Get a specific notification template"""
     template = db.query(NotificationTemplate).filter(NotificationTemplate.id == template_id).first()
     if not template:
@@ -322,7 +364,7 @@ async def get_template(template_id: int, db: Session = Depends(get_db)):
 # ============================================================================
 
 
-@app.post("/notifications", tags=["Notifications"], status_code=201)
+@api_router.post("/notifications", tags=["Notifications"], status_code=201)
 async def send_notification(
     user_id: int,
     template_id: int,
@@ -333,6 +375,7 @@ async def send_notification(
     source_system: str = "system",
     data_payload: Optional[Dict[str, Any]] = None,
     db: Session = Depends(get_db),
+    actor: Dict[str, Any] = Depends(require_admin),
 ):
     """
     Send a notification to a user
@@ -364,14 +407,16 @@ async def send_notification(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.get("/users/{user_id}/notifications", tags=["Notifications"])
+@api_router.get("/users/{user_id}/notifications", tags=["Notifications"])
 async def get_user_notifications(
     user_id: int,
     unread_only: bool = False,
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
+    actor: Dict[str, Any] = Depends(require_bearer_actor),
 ):
+    assert_self_or_admin(actor, user_id)
     """Get notifications for a user"""
     notifications, total = NotificationService.get_user_notifications(
         db=db,
@@ -388,41 +433,71 @@ async def get_user_notifications(
     }
 
 
-@app.get("/notifications/{notification_id}", tags=["Notifications"])
+@api_router.get("/notifications/{notification_id}", tags=["Notifications"])
 async def get_notification(
     notification_id: int,
     db: Session = Depends(get_db),
+    actor: Dict[str, Any] = Depends(require_bearer_actor),
 ):
-    """Get a single notification record"""
+    """Get a single notification record. Actor must own the row OR be admin."""
     notification = NotificationService.get_notification_by_id(
         db=db,
         notification_id=notification_id,
     )
     if not notification:
         raise HTTPException(status_code=404, detail="Notification not found")
+    role = str(actor.get("canonical_role") or actor.get("role") or "").lower()
+    actor_user_id = actor.get("user_id")
+    if role not in ADMIN_BYPASS_ROLES_LOCAL and (
+        actor_user_id is None or int(actor_user_id) != int(notification.user_id)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "permission_denied", "reason": "not your notification"},
+        )
     return notification.to_dict()
 
 
-@app.put("/notifications/{notification_id}/read", tags=["Notifications"])
+@api_router.put("/notifications/{notification_id}/read", tags=["Notifications"])
 async def mark_notification_read(
     notification_id: int,
     user_id: int,
     db: Session = Depends(get_db),
+    actor: Dict[str, Any] = Depends(require_bearer_actor),
 ):
-    """Mark a notification as read"""
+    """Mark a notification as read. Caller must own the user_id query param
+    OR be admin."""
+    role = str(actor.get("canonical_role") or actor.get("role") or "").lower()
+    if role not in ADMIN_BYPASS_ROLES_LOCAL:
+        actor_uid = actor.get("user_id")
+        if actor_uid is None or int(actor_uid) != int(user_id):
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "permission_denied", "reason": "user_id mismatch"},
+            )
     notification = NotificationService.mark_as_read(db=db, notification_id=notification_id, user_id=user_id)
     if not notification:
         raise HTTPException(status_code=404, detail="Notification not found")
     return notification.to_dict()
 
 
-@app.delete("/notifications/{notification_id}", tags=["Notifications"])
+@api_router.delete("/notifications/{notification_id}", tags=["Notifications"])
 async def delete_notification(
     notification_id: int,
     user_id: int,
     db: Session = Depends(get_db),
+    actor: Dict[str, Any] = Depends(require_bearer_actor),
 ):
-    """Soft delete a notification"""
+    """Soft delete a notification. Caller must own the user_id query param
+    OR be admin."""
+    role = str(actor.get("canonical_role") or actor.get("role") or "").lower()
+    if role not in ADMIN_BYPASS_ROLES_LOCAL:
+        actor_uid = actor.get("user_id")
+        if actor_uid is None or int(actor_uid) != int(user_id):
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "permission_denied", "reason": "user_id mismatch"},
+            )
     success = NotificationService.delete_notification(db=db, notification_id=notification_id, user_id=user_id)
     if not success:
         raise HTTPException(status_code=404, detail="Notification not found")
@@ -434,14 +509,19 @@ async def delete_notification(
 # ============================================================================
 
 
-@app.get("/users/{user_id}/preferences", tags=["Preferences"])
-async def get_user_preferences(user_id: int, db: Session = Depends(get_db)):
+@api_router.get("/users/{user_id}/preferences", tags=["Preferences"])
+async def get_user_preferences(
+    user_id: int,
+    db: Session = Depends(get_db),
+    actor: Dict[str, Any] = Depends(require_bearer_actor),
+):
     """Get notification preferences for a user"""
+    assert_self_or_admin(actor, user_id)
     preferences = UserPreferenceService.get_or_create_preferences(db=db, user_id=user_id)
     return preferences.to_dict()
 
 
-@app.put("/users/{user_id}/preferences", tags=["Preferences"])
+@api_router.put("/users/{user_id}/preferences", tags=["Preferences"])
 async def update_user_preferences(
     user_id: int,
     email_enabled: Optional[bool] = None,
@@ -454,7 +534,9 @@ async def update_user_preferences(
     quiet_hours_start: Optional[str] = None,
     quiet_hours_end: Optional[str] = None,
     db: Session = Depends(get_db),
+    actor: Dict[str, Any] = Depends(require_bearer_actor),
 ):
+    assert_self_or_admin(actor, user_id)
     """Update notification preferences"""
     preferences = UserPreferenceService.update_preferences(
         db=db,
@@ -477,14 +559,16 @@ async def update_user_preferences(
 # ============================================================================
 
 
-@app.post("/users/{user_id}/channels", tags=["Channels"], status_code=201)
+@api_router.post("/users/{user_id}/channels", tags=["Channels"], status_code=201)
 async def add_notification_channel(
     user_id: int,
     channel_type: str,
     channel_value: str,
     is_primary: bool = False,
     db: Session = Depends(get_db),
+    actor: Dict[str, Any] = Depends(require_bearer_actor),
 ):
+    assert_self_or_admin(actor, user_id)
     """
     Add a notification channel for user
 
@@ -502,13 +586,15 @@ async def add_notification_channel(
     return channel.to_dict()
 
 
-@app.get("/users/{user_id}/channels", tags=["Channels"])
+@api_router.get("/users/{user_id}/channels", tags=["Channels"])
 async def get_user_channels(
     user_id: int,
     channel_type: Optional[str] = None,
     verified_only: bool = False,
     db: Session = Depends(get_db),
+    actor: Dict[str, Any] = Depends(require_bearer_actor),
 ):
+    assert_self_or_admin(actor, user_id)
     """Get notification channels for a user"""
     channels = NotificationChannelService.get_user_channels(
         db=db,
@@ -519,34 +605,71 @@ async def get_user_channels(
     return {"channels": [c.to_dict() for c in channels]}
 
 
-@app.post("/channels/{channel_id}/verify", tags=["Channels"])
+@api_router.post("/channels/{channel_id}/verify", tags=["Channels"])
 async def verify_channel(
     channel_id: int,
     verification_token: str,
     db: Session = Depends(get_db),
+    actor: Dict[str, Any] = Depends(require_bearer_actor),
 ):
-    """Verify a notification channel"""
+    """Verify a notification channel. Caller must own the channel OR be admin."""
+    channel = NotificationChannelService.get_channel_by_id(db=db, channel_id=channel_id)
+    if not channel:
+        raise HTTPException(status_code=404, detail="Channel not found")
+    role = str(actor.get("canonical_role") or actor.get("role") or "").lower()
+    if role not in ADMIN_BYPASS_ROLES_LOCAL:
+        actor_uid = actor.get("user_id")
+        if actor_uid is None or int(actor_uid) != int(channel.user_id):
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "permission_denied", "reason": "not your channel"},
+            )
     success = NotificationChannelService.verify_channel(db=db, channel_id=channel_id, verification_token=verification_token)
     if not success:
         raise HTTPException(status_code=400, detail="Verification failed")
     return {"message": "Channel verified"}
 
 
-@app.get("/channels/{channel_id}", tags=["Channels"])
+@api_router.get("/channels/{channel_id}", tags=["Channels"])
 async def get_channel(
     channel_id: int,
     db: Session = Depends(get_db),
+    actor: Dict[str, Any] = Depends(require_bearer_actor),
 ):
-    """Retrieve a specific notification channel"""
+    """Retrieve a specific notification channel. Caller must own the channel
+    OR be admin."""
     channel = NotificationChannelService.get_channel_by_id(db=db, channel_id=channel_id)
     if not channel:
         raise HTTPException(status_code=404, detail="Channel not found")
+    role = str(actor.get("canonical_role") or actor.get("role") or "").lower()
+    if role not in ADMIN_BYPASS_ROLES_LOCAL:
+        actor_uid = actor.get("user_id")
+        if actor_uid is None or int(actor_uid) != int(channel.user_id):
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "permission_denied", "reason": "not your channel"},
+            )
     return channel.to_dict()
 
 
-@app.delete("/channels/{channel_id}", tags=["Channels"])
-async def deactivate_channel(channel_id: int, db: Session = Depends(get_db)):
-    """Deactivate a notification channel"""
+@api_router.delete("/channels/{channel_id}", tags=["Channels"])
+async def deactivate_channel(
+    channel_id: int,
+    db: Session = Depends(get_db),
+    actor: Dict[str, Any] = Depends(require_bearer_actor),
+):
+    """Deactivate a notification channel. Caller must own the channel OR be admin."""
+    channel = NotificationChannelService.get_channel_by_id(db=db, channel_id=channel_id)
+    if not channel:
+        raise HTTPException(status_code=404, detail="Channel not found")
+    role = str(actor.get("canonical_role") or actor.get("role") or "").lower()
+    if role not in ADMIN_BYPASS_ROLES_LOCAL:
+        actor_uid = actor.get("user_id")
+        if actor_uid is None or int(actor_uid) != int(channel.user_id):
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "permission_denied", "reason": "not your channel"},
+            )
     success = NotificationChannelService.deactivate_channel(db=db, channel_id=channel_id)
     if not success:
         raise HTTPException(status_code=404, detail="Channel not found")
@@ -558,10 +681,11 @@ async def deactivate_channel(channel_id: int, db: Session = Depends(get_db)):
 # ============================================================================
 
 
-@app.get("/delivery/pending", tags=["Delivery"])
+@api_router.get("/delivery/pending", tags=["Delivery"])
 async def get_pending_deliveries(
     limit: int = Query(100, ge=1, le=1000),
     db: Session = Depends(get_db),
+    actor: Dict[str, Any] = Depends(require_admin),
 ):
     """Get pending deliveries for retry processing"""
     deliveries = DeliveryService.get_pending_deliveries(db=db, limit=limit)
@@ -571,11 +695,12 @@ async def get_pending_deliveries(
     }
 
 
-@app.post("/delivery/{delivery_log_id}/success", tags=["Delivery"])
+@api_router.post("/delivery/{delivery_log_id}/success", tags=["Delivery"])
 async def mark_delivery_success(
     delivery_log_id: int,
     external_message_id: Optional[str] = None,
     db: Session = Depends(get_db),
+    actor: Dict[str, Any] = Depends(require_admin),
 ):
     """Mark a delivery as successful"""
     delivery = DeliveryService.mark_delivered(
@@ -588,13 +713,14 @@ async def mark_delivery_success(
     return delivery.to_dict()
 
 
-@app.post("/delivery/{delivery_log_id}/failure", tags=["Delivery"])
+@api_router.post("/delivery/{delivery_log_id}/failure", tags=["Delivery"])
 async def mark_delivery_failure(
     delivery_log_id: int,
     error_message: str,
     status_code: Optional[int] = None,
     should_retry: bool = True,
     db: Session = Depends(get_db),
+    actor: Dict[str, Any] = Depends(require_admin),
 ):
     """Mark a delivery as failed"""
     if hasattr(DeliveryService, "mark_failed"):
@@ -612,10 +738,11 @@ async def mark_delivery_failure(
         raise HTTPException(status_code=500, detail="mark_failed not implemented")
 
 
-@app.get("/notifications/{notification_id}/delivery-stats", tags=["Delivery"])
+@api_router.get("/notifications/{notification_id}/delivery-stats", tags=["Delivery"])
 async def get_delivery_statistics(
     notification_id: int,
     db: Session = Depends(get_db),
+    actor: Dict[str, Any] = Depends(require_admin),
 ):
     """Get delivery statistics for a notification"""
     if hasattr(DeliveryService, "get_delivery_statistics"):
@@ -630,7 +757,7 @@ async def get_delivery_statistics(
 # ============================================================================
 
 
-@app.post("/batches", tags=["Batches"], status_code=201)
+@api_router.post("/batches", tags=["Batches"], status_code=201)
 async def create_notification_batch(
     batch_name: str,
     batch_type: str,
@@ -638,6 +765,7 @@ async def create_notification_batch(
     target_user_count: Optional[int] = None,
     created_by: Optional[int] = None,
     db: Session = Depends(get_db),
+    actor: Dict[str, Any] = Depends(require_admin),
 ):
     """
     Create a new notification batch
@@ -655,24 +783,37 @@ async def create_notification_batch(
     return batch.to_dict()
 
 
-@app.post("/batches/{batch_id}/schedule", tags=["Batches"])
+@api_router.post("/batches/{batch_id}/schedule", tags=["Batches"])
 async def schedule_batch(
     batch_id: int,
     scheduled_time: datetime,
     db: Session = Depends(get_db),
+    actor: Dict[str, Any] = Depends(require_admin),
 ):
     """Schedule a batch for sending"""
     batch = NotificationBatchService.schedule_batch(db=db, batch_id=batch_id, scheduled_time=scheduled_time)
     return batch.to_dict()
 
 
-@app.get("/batches/{batch_id}/stats", tags=["Batches"])
-async def get_batch_statistics(batch_id: int, db: Session = Depends(get_db)):
+@api_router.get("/batches/{batch_id}/stats", tags=["Batches"])
+async def get_batch_statistics(
+    batch_id: int,
+    db: Session = Depends(get_db),
+    actor: Dict[str, Any] = Depends(require_admin),
+):
     """Get statistics for a notification batch"""
     stats = NotificationBatchService.get_batch_statistics(db=db, batch_id=batch_id)
     if not stats:
         raise HTTPException(status_code=404, detail="Batch not found")
     return stats
+
+
+# ============================================================================
+# Mount the prefixed router on the FastAPI app
+# ============================================================================
+# This must come AFTER all @api_router decorators above. Adding routes to a
+# router after include_router() does not retroactively register them.
+app.include_router(api_router)
 
 
 # ============================================================================
