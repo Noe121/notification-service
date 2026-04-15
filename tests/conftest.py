@@ -12,8 +12,9 @@ from pathlib import Path
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 
-# Add src directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+# Add service root to path so `src.*` imports resolve when pytest is run
+# from the notification-service repo root.
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.models import Base
 

@@ -85,14 +85,31 @@ except ImportError:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 # Database setup — credentials injected by ECS secrets block
+_PROD_ENVS = {"production", "prod", "staging", "stage"}
+
+
 def _build_db_url() -> str:
-    """Build MySQL URL from env vars (DB_HOST, DB_USERNAME, DB_PASSWORD, DB_NAME)."""
+    """Build MySQL URL from env vars (DB_HOST, DB_USERNAME, DB_PASSWORD, DB_NAME).
+
+    OWASP Phase 1-3 §A05 #1: a missing DB_PASSWORD used to silently
+    fall back to SQLite — the same anti-pattern the Phase-4 audit
+    killed elsewhere. In non-dev envs, boot fail-closed with a
+    RuntimeError so the operator sees the misconfiguration at deploy
+    time instead of a silent SQLite session a week later.
+    """
     host = os.getenv("DB_HOST", "localhost")
     port = os.getenv("DB_PORT", "3306")
     user = os.getenv("DB_USERNAME", "notifuser")
     password = os.getenv("DB_PASSWORD", "")
     dbname = os.getenv("DB_NAME", "notifications_db")
+    env = os.getenv("ENVIRONMENT", "development").strip().lower()
     if not password:
+        if env in _PROD_ENVS:
+            raise RuntimeError(
+                "DB_PASSWORD is empty in a non-dev environment "
+                f"(ENVIRONMENT={env!r}). Refusing SQLite fallback. "
+                "Set DB_PASSWORD or DATABASE_URL."
+            )
         import warnings
         warnings.warn(
             "DB_PASSWORD not set — falling back to SQLite. "
