@@ -363,7 +363,18 @@ class TestNotificationChannels:
         assert len(channels) == 2
 
     def test_verify_channel(self, db_session: Session):
-        """Test verifying a notification channel"""
+        """Test verifying a notification channel.
+
+        The hardened ``verify_channel`` path requires a 32-128 char URL-safe
+        token AND the row must carry a stored SHA-256 hash of that token
+        (plaintext tokens are never persisted). We simulate that here by
+        minting a realistic 32-byte secrets.token_urlsafe value, storing its
+        hash on the row, and submitting the plaintext through the service.
+        """
+        import hashlib
+        import secrets
+        from datetime import datetime, timedelta
+
         channel = NotificationChannelService.add_channel(
             db=db_session,
             user_id=1,
@@ -371,19 +382,27 @@ class TestNotificationChannels:
             channel_value="user@example.com",
         )
 
-        # Simulate setting verification token
-        setattr(channel, "verification_token", "token123")
+        # Mint a realistic verification token (~43 chars URL-safe) and
+        # persist ONLY its SHA-256 hash on the row, matching what the
+        # production add_channel path does.
+        raw_token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+        channel.verification_token_hash = token_hash
+        channel.verification_token_expires_at = datetime.utcnow() + timedelta(hours=24)
         db_session.commit()
+
         channel_id = getattr(channel, "id", None)
         assert channel_id is not None
         success = NotificationChannelService.verify_channel(
             db=db_session,
             channel_id=channel_id,
-            verification_token="token123",
+            verification_token=raw_token,
         )
         assert success is True
         db_session.refresh(channel)
         assert getattr(channel, "is_verified", None) == 1
+        # Single-use: hash is cleared after successful verify.
+        assert getattr(channel, "verification_token_hash", None) is None
 
     def test_deactivate_channel(self, db_session: Session):
         """Test deactivating a notification channel"""

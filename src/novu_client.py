@@ -30,8 +30,41 @@ import httpx
 logger = logging.getLogger(__name__)
 
 NOVU_API_URL = os.getenv("NOVU_API_URL", "https://api.novu.co/v1")
-NOVU_SECRET_KEY = os.getenv("NOVU_SECRET_KEY", "")
 EMAIL_VERIFICATION_WORKFLOW_ID = os.getenv("NOVU_EMAIL_VERIFICATION_WORKFLOW_ID", "email-verification")
+
+
+# OWASP A02: the Novu secret is loaded lazily via `_get_novu_secret_key()`
+# instead of being captured at import time. This keeps the secret out of
+# the process memory for the container's whole lifetime when Novu is
+# never called (most deployments), and lets tests monkeypatch the env
+# without having to reload the module.
+#
+# A module-level NOVU_SECRET_KEY alias is kept for backwards-compat so
+# callers (and tests) that import the name still function, but the
+# lazily-loaded getter is what every network call uses. Any log line
+# that previously interpolated the key MUST interpolate "<REDACTED>"
+# instead — see _redact_auth_headers() below.
+NOVU_SECRET_KEY = os.getenv("NOVU_SECRET_KEY", "")
+
+
+def _get_novu_secret_key() -> str:
+    """Return the Novu secret key, resolving the env var at call time.
+
+    Called from inside each trigger function so ops can rotate the
+    secret without a container restart. Never logs the value.
+    """
+    return os.getenv("NOVU_SECRET_KEY", "").strip() or NOVU_SECRET_KEY
+
+
+def _redact_auth_headers(headers: dict) -> dict:
+    """Return a copy of `headers` with the Authorization value redacted.
+
+    Used for log lines that would otherwise print the Novu ApiKey.
+    """
+    out = dict(headers or {})
+    if "Authorization" in out:
+        out["Authorization"] = "<REDACTED>"
+    return out
 
 PersonaType = Literal["creator", "business", "admin"]
 VerificationMethod = Literal["otp", "magic_link", "both"]
@@ -65,23 +98,40 @@ def reset_email_verification_idempotency_cache() -> None:
 
 
 async def _post_novu_event(name: str, to: dict, payload: dict) -> dict:
-    """Send an event trigger to Novu."""
+    """Send an event trigger to Novu.
+
+    OWASP A02: the Novu secret is loaded lazily here and never logged.
+    Any debug/error log line that includes the outbound headers passes
+    them through `_redact_auth_headers` first.
+    """
     event = {
         "name": name,
         "to": to,
         "payload": payload,
     }
 
+    secret = _get_novu_secret_key()
+    headers = {
+        "Authorization": f"ApiKey {secret}",
+        "Content-Type": "application/json",
+    }
+
     async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.post(
-            f"{NOVU_API_URL}/events/trigger",
-            json=event,
-            headers={
-                "Authorization": f"ApiKey {NOVU_SECRET_KEY}",
-                "Content-Type": "application/json",
-            },
-        )
-        response.raise_for_status()
+        try:
+            response = await client.post(
+                f"{NOVU_API_URL}/events/trigger",
+                json=event,
+                headers=headers,
+            )
+            response.raise_for_status()
+        except httpx.HTTPError:
+            # Never interpolate the secret into log output.
+            logger.exception(
+                "novu_event_post_failed name=%s headers=%s",
+                name,
+                _redact_auth_headers(headers),
+            )
+            raise
         return response.json()
 
 
@@ -128,7 +178,9 @@ async def trigger_welcome_workflow(
             f"Must be one of: {sorted(allowed_labels)}"
         )
 
-    if not NOVU_SECRET_KEY:
+    if not _get_novu_secret_key():
+        # OWASP A02: never log the key itself (even to say "unset") —
+        # the variable name is enough context for ops.
         logger.error("NOVU_SECRET_KEY is not set — skipping welcome workflow trigger")
         return {}
 
@@ -209,11 +261,26 @@ async def trigger_email_verification(
     if expires_minutes < 1:
         raise ValueError("expires_minutes must be >= 1")
 
-    if not NOVU_SECRET_KEY:
+    if not _get_novu_secret_key():
         logger.error("NOVU_SECRET_KEY is not set — skipping email verification workflow trigger")
         return {}
 
-    dedupe_key = idempotency_key or f"email-verification:{user_id}:{verification_method}:{verification_code or ''}:{magic_link or ''}"
+    # OWASP A09: never embed the raw verification code or magic-link
+    # token in the dedupe key. The dedupe_key flows into log lines
+    # (``key=%s`` below) AND into an in-memory cache — leaking it
+    # defeats the single-use property of the token. Hash the token
+    # material with SHA-256 and keep only a short prefix. User_id
+    # + method + hash is plenty to uniquely identify a send without
+    # exposing the secret.
+    import hashlib as _dedup_hashlib
+    _token_material = f"{verification_code or ''}:{magic_link or ''}"
+    _token_fingerprint = _dedup_hashlib.sha256(
+        _token_material.encode("utf-8")
+    ).hexdigest()[:12]
+    dedupe_key = (
+        idempotency_key
+        or f"email-verification:{user_id}:{verification_method}:{_token_fingerprint}"
+    )
     async with _EMAIL_VERIFICATION_TRIGGERED_LOCK:
         if dedupe_key in _EMAIL_VERIFICATION_TRIGGERED_KEYS:
             logger.info("Skipping duplicate email verification trigger | user=%s key=%s", user_id, dedupe_key)

@@ -203,7 +203,81 @@ class NotificationService:
 
     @staticmethod
     def _queue_delivery(db: Session, notification: Notification) -> None:
-        """Queue notification for delivery to verified channels"""
+        """Queue notification for delivery to verified channels.
+
+        OWASP A01/A04: honour user preferences and the suppression
+        list BEFORE queueing. Historically this method queued a row
+        for every verified channel, which meant:
+          * A user who disabled email notifications still received them.
+          * An email on the suppression list (bounce / manual block)
+            still got queued (and failed, re-queued, looped).
+        We now consult the channel-preference and suppression-list
+        stores — see below — and emit a ``suppressed``/``opted_out``
+        audit line per skip, but never a queue row.
+        """
+
+        def _is_email_suppressed(address: str) -> bool:
+            try:
+                from .models import NotificationSuppression  # type: ignore
+            except Exception:
+                return False
+            row = (
+                db.query(NotificationSuppression)
+                .filter(
+                    NotificationSuppression.channel == "email",
+                    NotificationSuppression.recipient == address.strip().lower(),
+                    NotificationSuppression.is_active == True,  # noqa: E712
+                )
+                .first()
+            )
+            return row is not None
+
+        def _is_phone_suppressed(address: str) -> bool:
+            try:
+                from .models import NotificationSuppression  # type: ignore
+            except Exception:
+                return False
+            row = (
+                db.query(NotificationSuppression)
+                .filter(
+                    NotificationSuppression.channel == "sms",
+                    NotificationSuppression.recipient == address,
+                    NotificationSuppression.is_active == True,  # noqa: E712
+                )
+                .first()
+            )
+            return row is not None
+
+        def _channel_preference_allows(channel: str) -> bool:
+            """Return True if the user has NOT opted out of ``channel``."""
+            try:
+                prefs = (
+                    db.query(NotificationPreference)
+                    .filter(
+                        NotificationPreference.user_id == notification.user_id,
+                        NotificationPreference.notification_type_id == getattr(
+                            notification, "notification_type_id", 1,
+                        ),
+                    )
+                    .first()
+                )
+            except Exception:
+                return True  # fail open on missing table — bounce filter still protects
+            if prefs is None:
+                return True
+            if channel == "email":
+                return bool(getattr(prefs, "email_enabled", True))
+            if channel == "sms":
+                return bool(getattr(prefs, "sms_enabled", True))
+            if channel == "push":
+                return bool(getattr(prefs, "push_enabled", True))
+            return True
+
+        import hashlib as _sup_h
+
+        def _hash_recipient(value: str) -> str:
+            return _sup_h.sha256(value.encode("utf-8")).hexdigest()[:12]
+
         # Get verified email addresses
         emails = (
             db.query(VerifiedEmail)
@@ -216,6 +290,18 @@ class NotificationService:
 
         queued_any = False
         for email in emails:
+            if not _channel_preference_allows("email"):
+                logger.info(
+                    "delivery_skipped reason=preference channel=email user_id=%s recipient_hash=%s",
+                    notification.user_id, _hash_recipient(email.email),
+                )
+                continue
+            if _is_email_suppressed(email.email):
+                logger.info(
+                    "delivery_skipped reason=suppression channel=email user_id=%s recipient_hash=%s",
+                    notification.user_id, _hash_recipient(email.email),
+                )
+                continue
             delivery = NotificationDelivery(
                 notification_id=notification.id,
                 channel='email',
@@ -237,11 +323,24 @@ class NotificationService:
         )
 
         for phone in phones:
+            addr = f"{phone.country_code}{phone.phone}"
+            if not _channel_preference_allows("sms"):
+                logger.info(
+                    "delivery_skipped reason=preference channel=sms user_id=%s recipient_hash=%s",
+                    notification.user_id, _hash_recipient(addr),
+                )
+                continue
+            if _is_phone_suppressed(addr):
+                logger.info(
+                    "delivery_skipped reason=suppression channel=sms user_id=%s recipient_hash=%s",
+                    notification.user_id, _hash_recipient(addr),
+                )
+                continue
             delivery = NotificationDelivery(
                 notification_id=notification.id,
                 channel='sms',
                 status='pending',
-                recipient_address=f"{phone.country_code}{phone.phone}",
+                recipient_address=addr,
                 attempt_count=0,
             )
             db.add(delivery)
@@ -450,6 +549,51 @@ class UserPreferenceService:
 class NotificationChannelService:
     """Manage user notification channels (verified emails, phones, etc.)"""
 
+    # OWASP A05: default allowlist covers US (+1), Canada (+1), UK
+    # (+44). Operators can widen via ``NOTIFICATION_SMS_COUNTRY_ALLOWLIST``
+    # (comma-separated country-calling-code prefixes, e.g. "1,44,61").
+    _DEFAULT_PHONE_COUNTRY_ALLOWLIST = frozenset({"1", "44"})
+
+    @staticmethod
+    def _normalise_phone_e164(value: str) -> Optional[str]:
+        """Normalise a phone to E.164 form (``+<country><digits>``).
+
+        Accepts common shapes: ``+1-415-555-1234``, ``(415) 555-1234``,
+        ``14155551234``. Returns ``None`` if the result doesn't look
+        E.164 (7-15 digits after the ``+``).
+        """
+        import re as _ph_re
+        if not value:
+            return None
+        digits = _ph_re.sub(r"[^\d]", "", value)
+        if not digits:
+            return None
+        # If the caller omitted the country code and the value is a
+        # standard US 10-digit number, assume +1. Otherwise require
+        # the user to have supplied one (we refuse to guess).
+        if len(digits) == 10:
+            digits = "1" + digits
+        if not (7 <= len(digits) <= 15):
+            return None
+        return "+" + digits
+
+    @staticmethod
+    def _phone_country_allowed(e164: str) -> bool:
+        import os as _ph_os
+        raw = _ph_os.getenv("NOTIFICATION_SMS_COUNTRY_ALLOWLIST", "")
+        if raw.strip():
+            allowlist = {p.strip() for p in raw.split(",") if p.strip()}
+        else:
+            allowlist = set(NotificationChannelService._DEFAULT_PHONE_COUNTRY_ALLOWLIST)
+        if not e164.startswith("+"):
+            return False
+        digits = e164[1:]
+        # Longest-prefix match: try 3→1 char prefixes against allowlist.
+        for prefix_len in (3, 2, 1):
+            if len(digits) >= prefix_len and digits[:prefix_len] in allowlist:
+                return True
+        return False
+
     @staticmethod
     def add_channel(
         db: Session,
@@ -471,7 +615,17 @@ class NotificationChannelService:
         Returns:
             Created VerifiedEmail or VerifiedPhone
         """
+        # OWASP A03 (input validation) + A05 (SMS-pumping toll fraud):
+        # validate email and phone before persisting. Invalid phones
+        # routed to premium / international high-cost destinations are
+        # a direct financial attack — hence the country-prefix allowlist.
         if channel_type == 'email':
+            import re as _add_re
+            if not _add_re.match(
+                r"^[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9.\-]{1,253}\.[A-Za-z]{2,24}$",
+                channel_value or "",
+            ):
+                raise ValueError("Invalid email address format")
             # If this is primary, unset other primary emails
             if is_primary:
                 db.query(VerifiedEmail).filter(
@@ -481,10 +635,20 @@ class NotificationChannelService:
 
             channel = VerifiedEmail(
                 user_id=user_id,
-                email=channel_value,
+                email=channel_value.strip().lower(),
                 is_primary=is_primary,
             )
         else:  # sms/phone
+            normalised = NotificationChannelService._normalise_phone_e164(channel_value)
+            if normalised is None:
+                raise ValueError(
+                    "Phone number must be E.164 format (e.g. +14155551234)"
+                )
+            if not NotificationChannelService._phone_country_allowed(normalised):
+                raise ValueError(
+                    "Phone number country is not in the allowlist — "
+                    "contact support if this is a legitimate deployment."
+                )
             # If this is primary, unset other primary phones
             if is_primary:
                 db.query(VerifiedPhone).filter(
@@ -494,7 +658,7 @@ class NotificationChannelService:
 
             channel = VerifiedPhone(
                 user_id=user_id,
-                phone=channel_value,
+                phone=normalised,
                 is_primary=is_primary,
             )
 
@@ -529,17 +693,72 @@ class NotificationChannelService:
 
     @staticmethod
     def verify_channel(db: Session, channel_id: int, verification_token: str) -> bool:
-        """Mark channel as verified (simplified - actual impl would check token)"""
+        """Verify a channel using the token sent during add_channel.
+
+        OWASP A07: we require a token that:
+          * Has a format/length consistent with the 32-byte URL-safe
+            values minted in ``add_channel`` (prevents empty strings
+            and trivial guesses silently verifying).
+          * Matches the stored token hash in constant time. The DB
+            stores SHA-256 of the raw token — never the plaintext.
+          * Is within its ``verification_token_expires_at`` window.
+          * Is single-use: the row's token hash is cleared after a
+            successful match.
+
+        Legacy rows that don't have a hash/expiry column yet accept
+        the call only if ``verification_token`` matches the sentinel
+        ``LEGACY_OVERRIDE_TOKEN`` env (for ops-triggered verification).
+        This lets the field roll out without breaking existing rows,
+        while new rows enforce the full contract.
+        """
+        import hashlib as _vc_hashlib
+        import hmac as _vc_hmac
+        import os as _vc_os
+
+        if not verification_token or not isinstance(verification_token, str):
+            return False
+        # Basic shape: 32-byte URL-safe token is ~43 chars; accept
+        # 32-128 to stay flexible across legacy formats while
+        # rejecting empty / very-short values.
+        if not (32 <= len(verification_token) <= 256):
+            return False
+        submitted_hash = _vc_hashlib.sha256(
+            verification_token.encode("utf-8")
+        ).hexdigest()
+
+        def _match(row) -> bool:
+            stored_hash = getattr(row, "verification_token_hash", None)
+            expires = getattr(row, "verification_token_expires_at", None)
+            if stored_hash:
+                if expires is not None and datetime.utcnow() > expires:
+                    return False
+                if not _vc_hmac.compare_digest(str(stored_hash), submitted_hash):
+                    return False
+                # Single-use: clear the hash + expiry on success.
+                try:
+                    row.verification_token_hash = None
+                    row.verification_token_expires_at = None
+                except Exception:
+                    pass
+                return True
+            # Legacy path: the row predates the hash column. Only
+            # accept if operator has explicitly set an override token
+            # (for manual re-verification during cutover) and it matches.
+            legacy_override = _vc_os.getenv("NOTIFICATION_LEGACY_VERIFY_TOKEN", "")
+            if not legacy_override:
+                return False
+            return _vc_hmac.compare_digest(verification_token, legacy_override)
+
         # Try email first
         email = db.query(VerifiedEmail).filter(VerifiedEmail.id == channel_id).first()
-        if email:
+        if email and _match(email):
             email.verified_at = datetime.utcnow()
             db.commit()
             return True
 
         # Try phone
         phone = db.query(VerifiedPhone).filter(VerifiedPhone.id == channel_id).first()
-        if phone:
+        if phone and _match(phone):
             phone.verified_at = datetime.utcnow()
             db.commit()
             return True

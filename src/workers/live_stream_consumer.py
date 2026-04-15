@@ -16,9 +16,33 @@ from typing import Any, Callable, Dict, Optional
 import boto3
 from sqlalchemy.orm import Session
 
+from ..event_verification import (
+    EventSignatureError,
+    require_event_hmac_key,
+    signature_required,
+    verify_signed_event,
+)
 from ..notification_service import NotificationService
 
 logger = logging.getLogger(__name__)
+
+# OWASP A08: live-streaming-service signs every event it publishes with
+# MONETIZATION_EVENT_HMAC_KEY (the same key used for monetization events
+# the service emits). Boot-fails outside dev when the key is missing.
+_MONETIZATION_KEY = require_event_hmac_key("MONETIZATION_EVENT_HMAC_KEY")
+
+
+def _verify_live_stream_event(payload: Dict[str, Any]) -> bool:
+    """Verify an inbound live-stream event. Returns False on any signature
+    failure; caller drops the message + deletes it from SQS."""
+    if not signature_required():
+        return True
+    try:
+        verify_signed_event(payload, _MONETIZATION_KEY, source="live_stream")
+        return True
+    except EventSignatureError as exc:
+        logger.warning("live_stream_event_signature_rejected reason=%s", exc)
+        return False
 
 # Map live-stream event types to NILBx notification_type slugs.
 # These slugs are looked up against notification templates in the DB.
@@ -76,6 +100,16 @@ class LiveStreamNotificationConsumer:
         body = json.loads(message["Body"])
         event_data = json.loads(body["Message"]) if "Message" in body else body
         event_type = event_data.get("event_type", "")
+
+        # OWASP A08: signature must validate before dispatch. Unverified
+        # events are dropped silently — the outer poll_and_process() still
+        # deletes the message from the queue so it doesn't come back.
+        if not _verify_live_stream_event(event_data):
+            logger.warning(
+                "live_stream_event_dropped_unverified event_type=%s",
+                event_type,
+            )
+            return
 
         notification_type = _NOTIFICATION_TYPE_MAP.get(event_type)
         if not notification_type:

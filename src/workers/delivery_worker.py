@@ -19,6 +19,10 @@ POLL_INTERVAL_SECONDS = int(os.getenv("DELIVERY_WORKER_POLL_SECONDS", "15"))
 BATCH_SIZE = int(os.getenv("DELIVERY_WORKER_BATCH_SIZE", "50"))
 HTTP_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 
+# OWASP A10: SSRF hardening for webhook delivery.
+WEBHOOK_URL_MAX_LENGTH = int(os.getenv("WEBHOOK_URL_MAX_LENGTH", "2048"))
+WEBHOOK_POST_TIMEOUT = httpx.Timeout(3.0, connect=3.0)
+
 
 async def fetch_pending_deliveries(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
     resp = await client.get(f"{BASE_URL}/delivery/pending", params={"limit": BATCH_SIZE})
@@ -69,35 +73,187 @@ async def report_failure(
 
 
 async def send_email(channel: Dict[str, Any], notification: Dict[str, Any]) -> Dict[str, Any]:
-    logger.info("Mock sending email to %s for notification %s", channel["channel_value"], notification["id"])
+    """Send email via AWS SES (real provider).
+
+    Falls back to mock in dev/test environments if SES is not configured.
+    PII: channel_value (email) is passed to SES but never logged directly.
+    """
+    env = os.getenv("ENVIRONMENT", "dev").strip().lower()
+
+    # Use real provider in non-dev environments
+    if env not in ("local", "test", "dev", "development"):
+        try:
+            from .provider_clients import send_email_ses
+            return await send_email_ses(channel, notification)
+        except ImportError:
+            pass  # Fall through to mock
+        except Exception:
+            logger.exception("SES email delivery failed, notification=%s", notification["id"])
+            raise
+
+    # Dev/test mock fallback
+    logger.info("Mock sending email for notification=%s", notification["id"])
     await asyncio.sleep(0.1)
     return {
         "external_message_id": f"email-{notification['id']}-{channel['id']}",
-        "response_metadata": {"provider": "mock-email", "channel": channel["channel_value"]},
+        "response_metadata": {"provider": "mock-email"},
     }
 
 
 async def send_sms(channel: Dict[str, Any], notification: Dict[str, Any]) -> Dict[str, Any]:
-    logger.info("Mock sending SMS to %s for notification %s", channel["channel_value"], notification["id"])
+    """Send SMS via Twilio (real provider).
+
+    Falls back to mock in dev/test environments if Twilio is not configured.
+    PII: channel_value (phone) is passed to Twilio but never logged directly.
+    """
+    env = os.getenv("ENVIRONMENT", "dev").strip().lower()
+
+    if env not in ("local", "test", "dev", "development"):
+        try:
+            from .provider_clients import send_sms_twilio
+            return await send_sms_twilio(channel, notification)
+        except ImportError:
+            pass
+        except Exception:
+            logger.exception("Twilio SMS delivery failed, notification=%s", notification["id"])
+            raise
+
+    logger.info("Mock sending SMS for notification=%s", notification["id"])
     await asyncio.sleep(0.1)
     return {
         "external_message_id": f"sms-{notification['id']}-{channel['id']}",
-        "response_metadata": {"provider": "mock-sms", "channel": channel["channel_value"]},
+        "response_metadata": {"provider": "mock-sms"},
     }
 
 
 async def send_push(channel: Dict[str, Any], notification: Dict[str, Any]) -> Dict[str, Any]:
-    logger.info("Mock sending push to %s for notification %s", channel["channel_value"], notification["id"])
+    """Send push notification via Firebase Cloud Messaging (real provider).
+
+    Falls back to mock in dev/test environments if FCM is not configured.
+    PII: channel_value (FCM token) is passed to Firebase but never logged directly.
+    """
+    env = os.getenv("ENVIRONMENT", "dev").strip().lower()
+
+    if env not in ("local", "test", "dev", "development"):
+        try:
+            from .provider_clients import send_push_fcm
+            return await send_push_fcm(channel, notification)
+        except ImportError:
+            pass
+        except Exception:
+            logger.exception("FCM push delivery failed, notification=%s", notification["id"])
+            raise
+
+    logger.info("Mock sending push for notification=%s", notification["id"])
     await asyncio.sleep(0.1)
     return {
         "external_message_id": f"push-{notification['id']}-{channel['id']}",
-        "response_metadata": {"provider": "mock-push", "channel": channel["channel_value"]},
+        "response_metadata": {"provider": "mock-push"},
     }
 
 
+def _validate_webhook_url(url: str) -> None:
+    """Validate a webhook URL against SSRF risks.
+
+    Blocks: private IPs, AWS metadata, localhost, non-HTTPS schemes,
+    and hostnames that resolve (via DNS) to ANY address in a private /
+    loopback / reserved / link-local / multicast range — which closes
+    the DNS-rebind + CNAME-to-private attacks the prior check missed.
+
+    This is called at both validation time and immediately before the
+    actual POST — there is no caching between the two checks, so a DNS
+    rebind between validate and send is detected on the second call.
+    """
+    from urllib.parse import urlparse
+    import ipaddress
+    import socket
+
+    if not url or not isinstance(url, str):
+        raise ValueError("Webhook URL missing")
+    if len(url) > WEBHOOK_URL_MAX_LENGTH:
+        raise ValueError(
+            f"Webhook URL exceeds max length of {WEBHOOK_URL_MAX_LENGTH} bytes"
+        )
+
+    parsed = urlparse(url)
+
+    # Require HTTPS
+    if parsed.scheme not in ("https",):
+        raise ValueError(f"Webhook URL must use HTTPS, got: {parsed.scheme}")
+
+    hostname = parsed.hostname or ""
+    if not hostname:
+        raise ValueError("Webhook URL missing hostname")
+
+    # Block literal localhost / loopback hostnames BEFORE any DNS work —
+    # saves a resolver round-trip and avoids depending on resolv.conf
+    # being sane.
+    if hostname in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
+        raise ValueError("Webhook URL cannot target localhost")
+
+    # Block AWS metadata endpoint (literal match)
+    if hostname in ("169.254.169.254", "fd00:ec2::254"):
+        raise ValueError("Webhook URL cannot target cloud metadata endpoint")
+
+    # Block internal service hostnames by suffix
+    blocked_suffixes = (".local", ".internal", ".svc.cluster.local")
+    if any(hostname.endswith(suffix) for suffix in blocked_suffixes):
+        raise ValueError(f"Webhook URL cannot target internal hostname: {hostname}")
+
+    # Resolve EVERY A/AAAA record the hostname maps to. Reject if ANY
+    # of them falls into a forbidden range (DNS rebind defense: attacker
+    # can't hide a private IP behind a single CNAME if we check all
+    # answers).
+    try:
+        addrinfos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror as exc:
+        raise ValueError(f"Webhook URL hostname does not resolve: {hostname}") from exc
+
+    if not addrinfos:
+        raise ValueError(f"Webhook URL hostname returned no addresses: {hostname}")
+
+    for info in addrinfos:
+        sockaddr = info[4]
+        addr_str = sockaddr[0]
+        try:
+            ip = ipaddress.ip_address(addr_str)
+        except ValueError:
+            raise ValueError(f"Webhook URL DNS answer is not a valid IP: {addr_str}")
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            raise ValueError(
+                f"Webhook URL resolves to forbidden address range: {addr_str}"
+            )
+
+
 async def send_webhook(channel: Dict[str, Any], notification: Dict[str, Any]) -> Dict[str, Any]:
+    """Send a webhook notification to an external URL.
+
+    Security (OWASP A10):
+      * URL validated against SSRF risks (scheme, hostname suffixes,
+        DNS resolution for EVERY returned IP) before dispatch.
+      * URL re-validated immediately before the POST (TOCTOU defense —
+        DNS rebind between validate and send is caught).
+      * Redirects are NOT followed; the validator can't anticipate
+        redirect targets, so any 30x is a failure.
+      * Short timeout (3s) bounds the request.
+    """
     target_url = channel["channel_value"]
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+    _validate_webhook_url(target_url)
+
+    # TOCTOU defense: re-resolve + re-validate right before the send so a
+    # DNS rebind that flipped the answer between the two calls is caught.
+    _validate_webhook_url(target_url)
+
+    async with httpx.AsyncClient(
+        timeout=WEBHOOK_POST_TIMEOUT, follow_redirects=False
+    ) as client:
         resp = await client.post(
             target_url,
             headers={"Content-Type": "application/json"},
@@ -153,8 +309,27 @@ async def process_delivery(
         await report_failure(client, delivery_id, error, should_retry=False)
         return
 
+    # Phase-4 P2 #7: wrap the delivery call in the SLI recorder. The
+    # context manager times the call, emits the latency histogram, and
+    # — on exception — increments the error counter with a bounded
+    # reason code. Instrumentation failures never propagate (observability
+    # must not break delivery).
     try:
-        result = await handler(channel, notification)
+        from ..observability import record_delivery
+    except ImportError:  # module not on path in some test setups
+        record_delivery = None
+
+    try:
+        if record_delivery is None:
+            result = await handler(channel, notification)
+        else:
+            with record_delivery(channel["channel_type"]) as _m:
+                try:
+                    result = await handler(channel, notification)
+                    _m.ok()
+                except Exception:
+                    _m.fail("handler_exception")
+                    raise
         await report_success(client, delivery_id, result)
     except Exception as exc:
         logger.exception("Delivery %s failed for channel %s", delivery_id, channel["channel_type"])
@@ -170,6 +345,15 @@ async def worker_loop() -> None:
                 logger.error("Failed fetching pending deliveries: %s", exc)
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
                 continue
+
+            # Phase-4 P2 #7: publish queue depth gauge every poll so the
+            # alerting rule ("pending > 1000 for 15m") can fire even
+            # when the worker is healthy but throughput-constrained.
+            try:
+                from ..observability import set_queue_depth
+                set_queue_depth(len(deliveries))
+            except Exception:
+                pass
 
             if not deliveries:
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)

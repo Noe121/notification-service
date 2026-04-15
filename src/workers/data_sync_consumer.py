@@ -13,6 +13,17 @@ from datetime import datetime
 import boto3
 from botocore.exceptions import ClientError
 
+# OWASP A08: inbound event signature verification. Every SNS sender
+# (payment-service, deliverable-service, live-commerce-service) HMAC-signs
+# its event payload; notification-service MUST verify before acting on the
+# event. Unverified events are dropped + logged + deleted from SQS.
+from src.event_verification import (
+    EventSignatureError,
+    require_event_hmac_key,
+    signature_required,
+    verify_signed_event,
+)
+
 logger = logging.getLogger("data-sync-consumer")
 
 # SQS Configuration
@@ -26,6 +37,61 @@ ADMIN_DASHBOARD_URL = os.getenv("ADMIN_DASHBOARD_URL", "http://localhost:8000").
 
 # Initialize SQS client
 sqs_client = boto3.client("sqs", region_name=os.getenv("AWS_REGION", "us-east-1"))
+
+# Per-sender HMAC keys. require_event_hmac_key() boot-fails outside dev
+# when any key is missing; in dev it logs a warning and returns "" so the
+# verifier fails closed on the actual verify step.
+_PAYMENT_KEY = require_event_hmac_key("PAYMENT_EVENT_HMAC_KEY")
+_DELIVERABLE_KEY = require_event_hmac_key("DELIVERABLE_EVENT_HMAC_KEY")
+_COMMERCE_KEY = require_event_hmac_key("COMMERCE_EVENT_HMAC_KEY")
+
+# Prefix → key lookup. The data-sync queue is subscribed to events from
+# multiple senders via SNS fan-out; route verification to the right key by
+# event_type prefix. contract.obligation.* / contract.fulfillment.* are
+# emitted by contract-service but use the deliverable HMAC key (shared
+# deployment pipeline).
+_KEY_BY_PREFIX = {
+    "payment.": _PAYMENT_KEY,
+    "deliverable.": _DELIVERABLE_KEY,
+    "contract.obligation.": _DELIVERABLE_KEY,
+    "contract.fulfillment.": _DELIVERABLE_KEY,
+    "commerce.": _COMMERCE_KEY,
+    # data_sync.completed events come from internal Lambda pipelines that
+    # also sign with the deliverable/commerce keys depending on origin;
+    # prefix match via "data_sync." routes to deliverable key by default.
+    "data_sync.": _DELIVERABLE_KEY,
+}
+
+
+def _verify_inbound_event(payload: Dict[str, Any]) -> bool:
+    """Return True iff payload carries a valid HMAC signature.
+
+    OWASP A08: fails closed — missing/invalid/expired signatures are
+    rejected. In dev, if ``NOTIFICATION_EVENT_SIGNATURE_REQUIRED=false``
+    is set, verification is skipped with a single log line.
+    """
+    et = str(payload.get("event_type") or "")
+    if not signature_required():
+        logger.info("inbound_event_signature_skipped_dev event_type=%s", et)
+        return True
+    key = None
+    for prefix, k in _KEY_BY_PREFIX.items():
+        if et.startswith(prefix):
+            key = k
+            break
+    if key is None:
+        logger.warning("unknown_event_type dropped event_type=%s", et)
+        return False
+    try:
+        verify_signed_event(payload, key, source=et)
+        return True
+    except EventSignatureError as exc:
+        logger.warning(
+            "notification_event_signature_rejected event_type=%s reason=%s",
+            et,
+            exc,
+        )
+        return False
 
 
 def parse_sync_event(message_body: str) -> Optional[Dict[str, Any]]:
@@ -171,6 +237,12 @@ async def process_message(message: Dict[str, Any]) -> bool:
         if not event:
             # Invalid format but delete anyway to avoid reprocessing
             logger.debug(f"Deleting invalid message: {body[:100]}")
+            sqs_client.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
+            return True
+
+        # OWASP A08: verify upstream HMAC signature BEFORE dispatching
+        # any handler. Unverified events are dropped + deleted (no retry).
+        if not _verify_inbound_event(event):
             sqs_client.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
             return True
 

@@ -25,6 +25,7 @@ hostname resolves out of the box.
 """
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 from typing import Any, Dict, Optional, Set
@@ -128,8 +129,17 @@ def require_bearer_actor(
 
     Raises 401 if neither is present or valid.
     """
-    # Internal service token bypass
-    if _INTERNAL_SERVICE_TOKEN and x_service_token and x_service_token == _INTERNAL_SERVICE_TOKEN:
+    # Internal service token bypass.
+    # Phase-4 audit review round: constant-time compare via
+    # hmac.compare_digest avoids the byte-by-byte short-circuit that
+    # ``==`` performs. The outer ``if _INTERNAL_SERVICE_TOKEN and
+    # x_service_token`` guard keeps ``compare_digest("", "")`` (which
+    # returns True) from silently accepting the empty case.
+    if (
+        _INTERNAL_SERVICE_TOKEN
+        and x_service_token
+        and hmac.compare_digest(x_service_token, _INTERNAL_SERVICE_TOKEN)
+    ):
         return {
             "user_id": None,
             "role": "service",

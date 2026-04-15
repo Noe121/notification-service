@@ -33,6 +33,59 @@ from sqlalchemy.orm import Mapped, declarative_base, mapped_column, relationship
 Base = declarative_base()
 
 
+# ---------------------------------------------------------------------------
+# PII masking helpers (OWASP A01/A03)
+# ---------------------------------------------------------------------------
+# Channel values (emails, phone numbers, FCM tokens) MUST NOT leak in bulk
+# API responses. The channel owner needs the unmasked value for UX (to
+# confirm which account / device); anyone else (admin read, another
+# user — which shouldn't happen but defense in depth) gets the masked
+# form.
+_ADMIN_ROLES = frozenset({
+    "admin",
+    "platform_admin",
+    "platform_ops",
+    "platform_system_admin",
+    "platform_support_admin",
+    "super_admin",
+    "nilbx_admin",
+    "service",
+})
+
+
+def _mask_email(value: str) -> str:
+    if not value or "@" not in value:
+        return ""
+    local, _, domain = value.partition("@")
+    if len(local) <= 2:
+        return f"{local[:1]}***@{domain}"
+    return f"{local[0]}{'*' * (len(local) - 2)}{local[-1]}@{domain}"
+
+
+def _mask_phone(value: str) -> str:
+    if not value:
+        return ""
+    digits = "".join(c for c in value if c.isdigit())
+    return f"***-***-{digits[-4:]}" if len(digits) >= 4 else "***-***-****"
+
+
+def _mask_address(value: str, channel_type: str) -> str:
+    if not value:
+        return ""
+    if channel_type == "email":
+        return _mask_email(value)
+    if channel_type in {"sms", "whatsapp"}:
+        return _mask_phone(value)
+    # FCM tokens, webhook URLs, anything else — hash-prefix so it's
+    # non-reversible but still comparable for debugging.
+    import hashlib as _mask_hashlib
+    return f"sha256:{_mask_hashlib.sha256(value.encode('utf-8')).hexdigest()[:12]}"
+
+
+def _is_admin_role(role: Optional[str]) -> bool:
+    return bool(role) and str(role).strip().lower() in _ADMIN_ROLES
+
+
 class NotificationType(Base):
     """
     Notification Types
@@ -363,13 +416,21 @@ class NotificationDelivery(Base):
         Index("idx_delivery_created_at", "created_at"),
     )
 
-    def to_dict(self):
+    def to_dict(self, actor_role: Optional[str] = None):
+        """Serialize a delivery row. Masks `recipient_address` unless the
+        caller is an admin role — fan-out APIs must never spray raw
+        addresses back. Internal callers that truly need the raw value
+        (e.g. the delivery worker) should read `recipient_address` off
+        the ORM object directly."""
+        show_raw = _is_admin_role(actor_role)
+        addr = self.recipient_address or ""
+        recipient_out = addr if show_raw else _mask_address(addr, self.channel or "")
         return {
             "id": self.id,
             "notification_id": self.notification_id,
             "channel": self.channel,
             "status": self.status,
-            "recipient_address": self.recipient_address,
+            "recipient_address": recipient_out,
             "provider": self.provider,
             "provider_message_id": self.provider_message_id,
             "attempt_count": self.attempt_count,
@@ -492,11 +553,23 @@ class VerifiedEmail(Base):
         Index("idx_email_is_primary", "is_primary"),
     )
 
-    def to_dict(self):
+    def to_dict(self, actor_role: Optional[str] = None, actor_user_id: Optional[int] = None):
+        """Serialize a verified email.
+
+        OWASP A01/A03: email address is masked unless the caller is the
+        owner of the channel OR has an admin role. Handler code passes
+        `actor_role` + `actor_user_id` from the authenticated actor; the
+        default (both None) masks, which is the safe-by-default behavior
+        whenever `to_dict()` is called without explicit context (e.g. the
+        delivery worker, or internal NotificationService callers).
+        """
+        is_owner = actor_user_id is not None and int(actor_user_id) == int(self.user_id or 0)
+        show_raw = is_owner or _is_admin_role(actor_role)
+        email_out = self.email if show_raw else _mask_email(self.email or "")
         return {
             "id": self.id,
             "user_id": self.user_id,
-            "email": self.email,
+            "email": email_out,
             "is_primary": self.is_primary,
             "verified_at": self.verified_at.isoformat() if self.verified_at else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -553,11 +626,16 @@ class VerifiedPhone(Base):
         Index("idx_phone_is_primary", "is_primary"),
     )
 
-    def to_dict(self):
+    def to_dict(self, actor_role: Optional[str] = None, actor_user_id: Optional[int] = None):
+        """Serialize a verified phone. See VerifiedEmail.to_dict for the
+        owner-vs-admin masking contract."""
+        is_owner = actor_user_id is not None and int(actor_user_id) == int(self.user_id or 0)
+        show_raw = is_owner or _is_admin_role(actor_role)
+        phone_out = self.phone if show_raw else _mask_phone(self.phone or "")
         return {
             "id": self.id,
             "user_id": self.user_id,
-            "phone": self.phone,
+            "phone": phone_out,
             "country_code": self.country_code,
             "is_primary": self.is_primary,
             "verified_at": self.verified_at.isoformat() if self.verified_at else None,
@@ -591,6 +669,86 @@ class VerifiedPhone(Base):
     @is_active.setter
     def is_active(self, value):
         self._is_active = bool(value)
+
+
+class UnsubscribeTokenConsumption(Base):
+    """Consumed unsubscribe token `jti` values (single-use enforcement).
+
+    OWASP A04: unsubscribe tokens are one-click + single-use. A repeat
+    submission of the same `jti` is rejected even when the signature and
+    expiration still validate.
+    """
+
+    __tablename__ = "unsubscribe_token_consumption"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    jti: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    user_id: Mapped[Optional[int]] = mapped_column(Integer)
+    channel_id: Mapped[Optional[int]] = mapped_column(Integer)
+    category: Mapped[Optional[str]] = mapped_column(String(100))
+    consumed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, default=datetime.utcnow
+    )
+
+    __table_args__ = (Index("idx_unsub_jti", "jti", unique=True),)
+
+
+class ProviderWebhookEvent(Base):
+    """Provider webhook dedup table (SES, Twilio, FCM).
+
+    OWASP A09: providers (re)deliver webhook events at-least-once. Without
+    dedup an attacker (or a legitimate retry) can flip a delivery row's
+    status back and forth. UNIQUE(provider, event_id) ensures replays are
+    a no-op — the INSERT fails and the handler short-circuits.
+    """
+
+    __tablename__ = "provider_webhook_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    provider: Mapped[str] = mapped_column(String(20), nullable=False)
+    event_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    first_seen_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, default=datetime.utcnow
+    )
+
+    __table_args__ = (
+        Index("idx_provider_event", "provider", "event_id", unique=True),
+    )
+
+
+class NotificationBatchApproval(Base):
+    """Two-person approval audit trail for large admin batch blasts.
+
+    OWASP A04: any batch whose recipient count exceeds
+    NOTIFICATION_BLAST_APPROVAL_THRESHOLD (default 1000) must be approved
+    by a second admin (different `user_id` from the creator). This table
+    is the immutable record: which creator, which approver, when, and
+    what recipient count.
+    """
+
+    __tablename__ = "notification_batch_approvals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    batch_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("notification_batches.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    created_by_user_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    approved_by_user_id: Mapped[Optional[int]] = mapped_column(Integer)
+    recipient_count: Mapped[Optional[int]] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="pending_approval"
+    )
+    created_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, default=datetime.utcnow
+    )
+    approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    __table_args__ = (
+        Index("idx_batch_approval_batch", "batch_id", unique=True),
+        Index("idx_batch_approval_status", "status"),
+    )
 
 
 # Legacy aliases for backwards compatibility
