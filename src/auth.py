@@ -95,7 +95,32 @@ def _validate_bearer_via_auth_service(token: str) -> Dict[str, Any]:
             detail="Invalid bearer token",
         )
 
-    payload = response.json()
+    # OWASP §A04 / DoS hardening — Day-6 finding 4 (2026-04-16):
+    # The preceding timeout=5 covers only request + response headers.
+    # A slow-body / malformed / chunked JSON response would hang the
+    # FastAPI thread indefinitely and exhaust the ALB connection pool
+    # (observed post scale-up 0→1). Cap the body read and fail-closed
+    # to 503 so operators see a clean "upstream unhealthy" signal
+    # instead of cascading timeouts. PII: log only the exception class
+    # name — `str(exc)` can echo body fragments carrying email / token
+    # material (same convention as crm-service's `_opaque_5xx`).
+    try:
+        payload = response.json()
+    except (ValueError, requests.RequestException) as exc:
+        logger.error(
+            "notification-service auth payload invalid: %s",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication service unavailable",
+        ) from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid bearer token",
+        )
+
     raw_user_id = payload.get("user_id") or payload.get("id")
     user_id: Optional[int] = None
     if raw_user_id is not None:
