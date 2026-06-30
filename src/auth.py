@@ -36,6 +36,11 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 logger = logging.getLogger(__name__)
 
+try:
+    from shared import s2s_auth
+except ImportError:  # pragma: no cover
+    s2s_auth = None  # type: ignore
+
 AUTH_SERVICE_URL = os.getenv(
     "AUTH_SERVICE_URL",
     "http://auth-service.dev.local:9000",
@@ -47,6 +52,11 @@ AUTH_SERVICE_URL = os.getenv(
 # SQS data-sync consumer + live-stream notification consumer that run
 # inside the same VPC.
 _INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "").strip()
+_S2S_ALLOWED_ISSUERS: frozenset = frozenset(
+    s.strip()
+    for s in os.getenv("SERVICE_TOKEN_ALLOWED_CALLERS", "admin-dashboard-service").split(",")
+    if s.strip()
+)
 
 # Roles that get blanket admin access to every notification route.
 # Mirrors the bypass set used by payment-service after the platform_admin
@@ -160,6 +170,38 @@ def require_bearer_actor(
     # ``==`` performs. The outer ``if _INTERNAL_SERVICE_TOKEN and
     # x_service_token`` guard keeps ``compare_digest("", "")`` (which
     # returns True) from silently accepting the empty case.
+    if x_service_token and s2s_auth is not None:
+        verdict = s2s_auth.verify_service_header(
+            x_service_token,
+            legacy_secret=_INTERNAL_SERVICE_TOKEN,
+            allowed_issuers=_S2S_ALLOWED_ISSUERS,
+        )
+        if verdict.ok:
+            service_name = (
+                verdict.issuer
+                if verdict.issuer and verdict.issuer != "legacy"
+                else "legacy"
+            )
+            return {
+                "user_id": None,
+                "role": "service",
+                "canonical_role": "service",
+                "email": None,
+                "permissions": [],
+                "auth_mode": "service_token",
+                "service_name": service_name,
+                "issuer": verdict.issuer,
+            }
+        if x_service_token.count(".") == 2:
+            logger.warning(
+                "notification-service s2s token rejected reason=%s issuer=%s",
+                verdict.failure_reason, verdict.issuer,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid service token",
+            )
+
     if (
         _INTERNAL_SERVICE_TOKEN
         and x_service_token
@@ -172,6 +214,8 @@ def require_bearer_actor(
             "email": None,
             "permissions": [],
             "auth_mode": "service_token",
+            "service_name": "legacy",
+            "issuer": "legacy",
         }
 
     if creds is None or creds.scheme.lower() != "bearer" or not creds.credentials:

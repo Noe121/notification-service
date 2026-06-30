@@ -66,6 +66,16 @@ except ImportError:
         sys.path.insert(0, _repo_root)
     from shared.middleware import CorrelationMiddleware, IdempotencyMiddleware, InMemoryIdempotencyBackend
 
+# Phase 3.11.H — centralized audit-log writer. Callers emit
+# ``notification.*`` event types; the writer routes them to
+# rbac_audit_log so the orchestrator's per-service operational
+# record stays in one queryable place. Caller MUST hash PII —
+# recipient email NEVER passed here.
+try:
+    from shared.audit_log_writer import append as _audit_append
+except ImportError:
+    _audit_append = None
+
 # ============================================================================
 # Setup
 # ============================================================================
@@ -391,8 +401,50 @@ def _enforce_admin_rate_limit(action: str, actor: Dict[str, Any]) -> None:
 # NIL Platform Middleware
 app.add_middleware(CorrelationMiddleware)
 app.add_middleware(CSRFMiddleware)  # CSRF: cookie-authenticated mutating requests
+
+
+def _build_idempotency_backend():
+    """Phase 3.11.H — MySQL idempotency backend (replaces in-memory).
+
+    Multi-pod correctness requires a shared store. The previous
+    ``InMemoryIdempotencyBackend`` silently dropped keys between
+    replicas, breaking the orchestrator's replay contract on
+    cross-service writes.
+
+    Falls back to in-memory in tests / when the engine isn't reachable.
+    Mirrors the crm-service pattern (crm-service/src/main.py:169-206).
+    """
+    try:
+        from shared.middleware.idempotency_mysql import MysqlIdempotencyBackend
+    except Exception as exc:  # pragma: no cover
+        logger.warning(
+            "idempotency_mysql_backend_unavailable — falling back to in-memory "
+            "(single-pod only): %s", type(exc).__name__,
+        )
+        return InMemoryIdempotencyBackend()
+
+    class _EnginePool:
+        def acquire(_self):
+            return engine.raw_connection()
+
+    try:
+        conn = _EnginePool().acquire()
+        try:
+            conn.close()
+        except Exception:
+            pass
+    except Exception as exc:  # pragma: no cover
+        logger.warning(
+            "idempotency_mysql_connection_unavailable — falling back to in-memory "
+            "(single-pod only): %s", type(exc).__name__,
+        )
+        return InMemoryIdempotencyBackend()
+
+    return MysqlIdempotencyBackend(_EnginePool())
+
+
 if os.getenv("IDEMPOTENCY_MIDDLEWARE_ENABLED", "false").lower() == "true":
-    app.add_middleware(IdempotencyMiddleware, backend=InMemoryIdempotencyBackend())
+    app.add_middleware(IdempotencyMiddleware, backend=_build_idempotency_backend())
 
 
 # ---------------------------------------------------------------------------
